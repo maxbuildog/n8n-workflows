@@ -1,0 +1,371 @@
+{
+  "name": "Shipping alerts: tracking number to order index (Shopify fulfillment webhook)",
+  "nodes": [
+    {
+      "id": "57b1a1f0-557f-415f-9047-22c274b5fa3a",
+      "name": "Shopify Fulfillment Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "shopify-fulfillment-created",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      }
+    },
+    {
+      "id": "a52e8407-b474-4394-b71f-b057d393976e",
+      "name": "Extract tracking + order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        690,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst results = [];\n\nconst orderName = body.order_name || body.name || '';\nconst orderId = body.order_id || body.id || '';\nconst email = body.email || (body.destination && body.destination.email) || '';\n\nconst trackingNumbers = body.tracking_numbers || [];\nconst trackingNumber = body.tracking_number || '';\nconst carrier = body.tracking_company || '';\n\nif (trackingNumbers.length > 0) {\n  for (const tn of trackingNumbers) {\n    results.push({\n      tracking_number: tn,\n      order_number: orderId.toString(),\n      order_name: orderName,\n      email: email.toLowerCase(),\n      carrier: carrier\n    });\n  }\n} else if (trackingNumber) {\n  results.push({\n    tracking_number: trackingNumber,\n    order_number: orderId.toString(),\n    order_name: orderName,\n    email: email.toLowerCase(),\n    carrier: carrier\n  });\n}\n\nif (results.length === 0) {\n  return [{ json: { skip: true, reason: 'No tracking number in fulfillment' } }];\n}\n\nreturn results.map(r => ({ json: r }));"
+      }
+    },
+    {
+      "id": "4cfba80c-9712-4f25-aaee-cd6a226b0ace",
+      "name": "Has tracking?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        940,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.tracking_number }}",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "d9350427-ece7-4f8f-ab35-b99c0aa8fc21",
+      "name": "Upsert DataTable",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1190,
+        240
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DATATABLEID"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "tracking_number",
+              "condition": "eq",
+              "keyValue": "={{ $json.tracking_number }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "tracking_number": "={{ $json.tracking_number }}",
+            "order_number": "={{ $json.order_number }}",
+            "order_name": "={{ $json.order_name }}",
+            "email": "={{ $json.email }}",
+            "carrier": "={{ $json.carrier }}"
+          },
+          "matchingColumns": [
+            "tracking_number"
+          ],
+          "schema": [
+            {
+              "id": "tracking_number",
+              "displayName": "tracking_number",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "order_number",
+              "displayName": "order_number",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "order_name",
+              "displayName": "order_name",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email",
+              "displayName": "email",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "carrier",
+              "displayName": "carrier",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "24d11940-6a80-45fe-a6c7-460f58fa81ca",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"status\": \"ok\"}",
+        "options": {}
+      }
+    },
+    {
+      "id": "b3ba5942-ba14-4ad2-8936-e1d9e554eb37",
+      "name": "17TRACK - Register",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1365,
+        240
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.17track.net/track/v2.4/register",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=[{\"number\": \"{{ $json.tracking_number }}\"}]",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "17TRACK token (header 17token)"
+        }
+      }
+    },
+    {
+      "id": "7f1c2d3e-0a11-4b52-9c01-aa0000000001",
+      "name": "Verify Shopify HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Verifies X-Shopify-Hmac-Sha256: base64 HMAC SHA-256 of the RAW request body, keyed with the webhook secret.\n// Needs NODE_FUNCTION_ALLOW_BUILTIN=crypto on the n8n instance and the Raw Body option on the webhook node.\n// Fails closed: a missing secret, header or raw body means the request is rejected.\nconst crypto = require('crypto');\nconst item = $input.first();\nconst secret = $env.SHOPIFY_WEBHOOK_SECRET || '';\nconst received = String((item.json.headers || {})['x-shopify-hmac-sha256'] || '');\nlet valid = false;\nif (secret && received && item.binary && item.binary.data) {\n  const raw = await this.helpers.getBinaryDataBuffer(0, 'data');\n  const expected = crypto.createHmac('sha256', secret).update(raw).digest('base64');\n  const a = Buffer.from(expected);\n  const b = Buffer.from(received);\n  valid = a.length === b.length && crypto.timingSafeEqual(a, b);\n}\nreturn [{ json: { valid, body: valid ? item.json.body : null } }];"
+      }
+    },
+    {
+      "id": "7f1c2d3e-0a11-4b52-9c01-aa0000000002",
+      "name": "Signature valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "v1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "7f1c2d3e-0a11-4b52-9c01-aa0000000003",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        690,
+        480
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"error\": \"unauthorized\"}",
+        "options": {
+          "responseCode": 401
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Shopify Fulfillment Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Shopify HMAC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract tracking + order": {
+      "main": [
+        [
+          {
+            "node": "Has tracking?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has tracking?": {
+      "main": [
+        [
+          {
+            "node": "Upsert DataTable",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert DataTable": {
+      "main": [
+        [
+          {
+            "node": "17TRACK - Register",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "17TRACK - Register": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Shopify HMAC": {
+      "main": [
+        [
+          {
+            "node": "Signature valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signature valid?": {
+      "main": [
+        [
+          {
+            "node": "Extract tracking + order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

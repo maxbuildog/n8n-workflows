@@ -1,0 +1,12 @@
+Date & Time,Platform,Author,Comment,Agent action,Posted reply,Comment ID,Agent internal note,Status
+2026-01-12T10:02:11.000Z,facebook,Jane Doe,How much is Product A?,reply,"Hello, you will find the current price of Product A here: https://your-store.example/products/product-a
+
+Reply from our AI assistant",1000001_2000001,price question answered from the knowledge base,Replied
+2026-01-12T10:15:40.000Z,instagram,sample_user,You are all idiots,hide,,17900000000000001,insult,Hidden
+2026-01-12T10:31:02.000Z,facebook,John Roe,Total waste of money. It doesn't work.,escalate,"Hello, we are sorry to hear that. Please contact us at support@example.com so we can look into it.
+
+Reply from our AI assistant",1000001_2000002,harsh criticism without a question: stays visible,Escalated: reply posted
+2026-01-12T10:44:19.000Z,facebook,Sam Poe,This looks dangerous,escalate,"Hello, thank you for letting us know. Please contact us at support@example.com so our team can look into this right away.
+
+Reply from our AI assistant",1000001_2000003,safety concern: never hidden and escalated to a human,Safety concern: escalated
+2026-01-12T11:05:57.000Z,instagram,another_user,@sam yes that is the one,ignore,,17900000000000002,conversation between two other people,Ignored

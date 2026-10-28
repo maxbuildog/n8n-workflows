@@ -1,0 +1,1139 @@
+{
+  "name": "Proactive shipping exception alerts (17TRACK webhooks + Shopify)",
+  "nodes": [
+    {
+      "id": "a89f454b-34fd-4459-b94d-cc30b7cbc335",
+      "name": "Webhook 17TRACK Push",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "carrier-tracking-events",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "3ac153b8-0768-429b-818f-0234c9c3a6b7",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"status\": \"ok\"}",
+        "options": {}
+      }
+    },
+    {
+      "id": "967d466f-d08b-4908-8079-55fa3e02c2d4",
+      "name": "Extract tracking from push",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// The push only tells us WHICH tracking number to re-read. Its status is never used for decisions.\nconst payload = $input.first().json.body || {};\nconst data = payload.data || {};\nconst numbers = new Set();\nfor (const t of (data.accepted || [])) { if (t && t.number) numbers.add(String(t.number)); }\nif (data.number) numbers.add(String(data.number));\nif (numbers.size === 0) return []; // nothing to re-read, the run stops here\nreturn [...numbers].map(n => ({ json: { tracking_number: n } }));"
+      }
+    },
+    {
+      "id": "3f32cd01-5ab3-4337-a9e8-84f06772700f",
+      "name": "17TRACK gettrackinfo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.17track.net/track/v2.4/gettrackinfo",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=[{\"number\": \"{{ $json.tracking_number }}\"}]",
+        "options": {},
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "17TRACK token (header 17token)"
+        }
+      }
+    },
+    {
+      "id": "6f555db4-794a-4727-903a-f21bde1199e8",
+      "name": "Extract 17TRACK status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Status comes ONLY from gettrackinfo (re-read at 17TRACK), never from the push body.\nconst push = $('Extract tracking from push').first().json;\nconst tr = $input.first().json;\nconst accepted = (tr.data && tr.data.accepted) || [];\nconst a = accepted.find(x => String(x.number) === push.tracking_number) || accepted[0];\nlet status = '';\nlet sub_status = '';\nlet description = '';\nlet latest_event_time = null;\nlet carrier_code = '';\nif (a) {\n  const ti = a.track_info || {};\n  const ls = ti.latest_status || {};\n  const le = ti.latest_event || {};\n  status = ls.status || '';\n  sub_status = ls.sub_status || '';\n  description = (le.description_translation && le.description_translation.description) || le.description || '';\n  latest_event_time = le.time_iso || null;\n  carrier_code = a.carrier || '';\n}\nreturn [{ json: { tracking_number: push.tracking_number, status, sub_status, description, latest_event_time, carrier_code } }];"
+      }
+    },
+    {
+      "id": "a38d1ced-b54e-425f-ab3f-a6cfcf0bb22e",
+      "name": "Problem status?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "or",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "Exception",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "Undelivered",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "c3",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "Expired",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "80e9b93f-d7eb-42d4-a33c-50649555250f",
+      "name": "DT - Look up order",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        200
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DATATABLEID"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "tracking_number",
+              "condition": "eq",
+              "keyValue": "={{ $json.tracking_number }}"
+            }
+          ]
+        },
+        "returnAll": false,
+        "limit": 1
+      }
+    },
+    {
+      "id": "08ccdb5c-a422-42c8-8b90-cda3ea608f65",
+      "name": "Merge data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        200
+      ],
+      "parameters": {
+        "jsCode": "const dt = $input.first().json;\nconst t17 = $('Extract 17TRACK status').first().json;\nreturn [{ json: { tracking_number: dt.tracking_number, order_name: dt.order_name || '', email: dt.email || '', carrier: dt.carrier || '', problem_status: t17.status, sub_status: t17.sub_status, description: t17.description } }];"
+      }
+    },
+    {
+      "id": "fcfd2025-8f8f-4457-8f6e-ee034d3bb310",
+      "name": "Email present?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.email }}",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "ca14783b-a8ee-4631-b953-b870bdf62e80",
+      "name": "DT - Not yet alerted?",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2420,
+        200
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DATATABLEID"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "tracking_number",
+              "condition": "eq",
+              "keyValue": "={{ $json.tracking_number }}"
+            },
+            {
+              "keyName": "problem_status",
+              "condition": "eq",
+              "keyValue": "={{ $json.problem_status }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "f486a0f4-6220-4744-be2a-1550fbdb13ad",
+      "name": "Klaviyo - Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2640,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://a.klaviyo.com/client/events/?company_id={{ $env.KLAVIYO_PUBLIC_API_KEY }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "revision",
+              "value": "={{ $json.klaviyo_revision }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.klaviyoBody) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "e3455b22-f7e1-4d74-8204-53b42fb00bf1",
+      "name": "DT - Record alert",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2860,
+        200
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DATATABLEID"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "tracking_number": "={{ $('Merge data').first().json.tracking_number }}",
+            "problem_status": "={{ $('Merge data').first().json.problem_status }}",
+            "sub_status": "={{ $('Merge data').first().json.sub_status }}",
+            "order_name": "={{ $('Merge data').first().json.order_name }}",
+            "email": "={{ $('Merge data').first().json.email }}",
+            "sent_at": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "tracking_number",
+              "displayName": "tracking_number",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "problem_status",
+              "displayName": "problem_status",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sub_status",
+              "displayName": "sub_status",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "order_name",
+              "displayName": "order_name",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email",
+              "displayName": "email",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sent_at",
+              "displayName": "sent_at",
+              "required": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "5845153d-5096-4dc9-a10d-9cc7a71304b3",
+      "name": "Build Klaviyo body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// Public tracking page of the store, replace with your own URL.\nconst TRACKING_PAGE_URL = 'YOUR_TRACKING_PAGE_URL';\n// Klaviyo API revision sent in the revision header of Klaviyo - Event. Klaviyo supports a revision for a limited time:\n// check the current one in the Klaviyo API documentation and bump it from time to time.\nconst KLAVIYO_REVISION = '2025-10-15';\nconst d = $input.first().json;\nconst body = {\n  data: {\n    type: 'event',\n    attributes: {\n      metric: { data: { type: 'metric', attributes: { name: 'Delivery Problem' } } },\n      profile: { data: { type: 'profile', attributes: { email: d.email } } },\n      properties: {\n        order_number: d.order_name || '',\n        tracking_number: d.tracking_number || '',\n        problem_type: d.problem_status || '',\n        problem_description: d.description || d.sub_status || d.problem_status || '',\n        tracking_url: TRACKING_PAGE_URL + '?tracking=' + (d.tracking_number || ''),\n        carrier: d.carrier || '',\n        sub_status: d.sub_status || ''\n      }\n    }\n  }\n};\nreturn [{ json: { klaviyo_revision: KLAVIYO_REVISION, klaviyoBody: body, email: d.email, tracking_number: d.tracking_number, order_name: d.order_name, problem_status: d.problem_status, sub_status: d.sub_status } }];"
+      }
+    },
+    {
+      "id": "72629a07-f722-4cad-a61f-f1e82a6312ce",
+      "name": "Delivered or out for delivery?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        540
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "or",
+          "conditions": [
+            {
+              "id": "d1",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "Delivered",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "d2",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "OutForDelivery",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a12f5c03-060a-4f50-8211-01da7776b008",
+      "name": "DT - Look up order (delivery)",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        540
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DATATABLEID"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "tracking_number",
+              "condition": "eq",
+              "keyValue": "={{ $json.tracking_number }}"
+            }
+          ]
+        },
+        "returnAll": false,
+        "limit": 1
+      }
+    },
+    {
+      "id": "3fe47283-8dc2-4232-8e0c-dd6c4d8cfa3e",
+      "name": "Merge delivery data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        540
+      ],
+      "parameters": {
+        "jsCode": "const dt = $input.first().json;\nconst t17 = $('Extract 17TRACK status').first().json;\nreturn [{ json: {\n  tracking_number: dt.tracking_number,\n  order_number: dt.order_number || '',\n  order_name: dt.order_name || '',\n  email: dt.email || '',\n  carrier: dt.carrier || '',\n  shipment_status_17: t17.status,\n  sub_status: t17.sub_status,\n  description: t17.description\n} }];"
+      }
+    },
+    {
+      "id": "82a2cba9-79c0-4128-96c6-6bb07e6a8c60",
+      "name": "Order present?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        540
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "o1",
+              "leftValue": "={{ $json.order_number }}",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "1dd5adb1-ea7a-44da-bcf1-ef3da6b79209",
+      "name": "DT - Not yet pushed to Shopify?",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2420,
+        540
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DATATABLEID"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "tracking_number",
+              "condition": "eq",
+              "keyValue": "={{ $json.tracking_number }}"
+            },
+            {
+              "keyName": "problem_status",
+              "condition": "eq",
+              "keyValue": "=shopify_{{ $json.shipment_status_17 === 'Delivered' ? 'delivered' : 'out_for_delivery' }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "f7670ae9-036a-41eb-8c3c-e69a5da9b245",
+      "name": "Shopify Get Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2860,
+        540
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $('Shopify config').first().json.shop_domain }}/admin/oauth/access_token",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"client_id\": \"{{ $env.SHOPIFY_CLIENT_ID }}\",\n  \"client_secret\": \"{{ $env.SHOPIFY_CLIENT_SECRET }}\",\n  \"grant_type\": \"client_credentials\"\n}",
+        "options": {}
+      }
+    },
+    {
+      "id": "624cbf7d-c69b-4f63-9af1-349f2d2144db",
+      "name": "Shopify Get Fulfillments",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3080,
+        540
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://{{ $('Shopify config').first().json.shop_domain }}/admin/api/{{ $('Shopify config').first().json.api_version }}/orders/{{ $('Merge delivery data').first().json.order_number }}/fulfillments.json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Shopify-Access-Token",
+              "value": "={{ $('Shopify Get Token').first().json.access_token }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "63faf69e-e742-4c36-93d9-a5b87e33f8c3",
+      "name": "Build Shopify event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3300,
+        540
+      ],
+      "parameters": {
+        "jsCode": "const fulfillments = ($input.first().json.fulfillments) || [];\nconst ctx = $('Merge delivery data').first().json;\nconst tracking = ctx.tracking_number;\nconst order_id = ctx.order_number;\nconst status17 = ctx.shipment_status_17;\nlet shopify_status = '';\nlet message = '';\nif (status17 === 'Delivered') { shopify_status = 'delivered'; message = 'Delivered'; }\nelse if (status17 === 'OutForDelivery') { shopify_status = 'out_for_delivery'; message = 'Out for delivery'; }\nconst f = fulfillments.find(fl => (fl.tracking_number === tracking) || ((fl.tracking_numbers || []).includes(tracking)));\nif (!f) return [{ json: { skip: true, reason: 'no fulfillment found', tracking_number: tracking } }];\nreturn [{ json: {\n  order_id,\n  fulfillment_id: f.id,\n  shopify_status,\n  message,\n  tracking_number: tracking,\n  order_name: ctx.order_name,\n  email: ctx.email\n} }];"
+      }
+    },
+    {
+      "id": "5b1e7f0a-3c42-4d9e-8a16-0c7d2f9b6e11",
+      "name": "Fulfillment found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3520,
+        540
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "f1",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      },
+      "notes": "Stops here when Build Shopify event returned a skip marker (no fulfillment matches the tracking number): nothing is written to Shopify."
+    },
+    {
+      "id": "005cd527-178a-4951-be34-e4df35f8c606",
+      "name": "Shopify POST Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3740,
+        540
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $('Shopify config').first().json.shop_domain }}/admin/api/{{ $('Shopify config').first().json.api_version }}/orders/{{ $json.order_id }}/fulfillments/{{ $json.fulfillment_id }}/events.json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Shopify-Access-Token",
+              "value": "={{ $('Shopify Get Token').first().json.access_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"event\": {\n    \"status\": \"{{ $json.shopify_status }}\",\n    \"message\": \"{{ $json.message }}\"\n  }\n}",
+        "options": {}
+      }
+    },
+    {
+      "id": "3f69f78f-eac8-4570-859c-b3619bb50fb9",
+      "name": "DT - Record Shopify push",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3960,
+        540
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DATATABLEID"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "tracking_number": "={{ $('Build Shopify event').first().json.tracking_number }}",
+            "problem_status": "=shopify_{{ $('Build Shopify event').first().json.shopify_status }}",
+            "sub_status": "={{ $('Build Shopify event').first().json.shopify_status }}",
+            "order_name": "={{ $('Build Shopify event').first().json.order_name }}",
+            "email": "={{ $('Build Shopify event').first().json.email }}",
+            "sent_at": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "tracking_number",
+              "displayName": "tracking_number",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "problem_status",
+              "displayName": "problem_status",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sub_status",
+              "displayName": "sub_status",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "order_name",
+              "displayName": "order_name",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email",
+              "displayName": "email",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sent_at",
+              "displayName": "sent_at",
+              "required": false,
+              "display": true,
+              "type": "date",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "8a2d3e4f-0b22-4c63-8d02-bb0000000001",
+      "name": "Verify push token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Shared-secret check. The push URL registered at 17TRACK must end with ?token=<TRACK17_WEBHOOK_TOKEN>.\n// Both values are hashed first so the comparison is constant time whatever their lengths.\n// Fails closed: if TRACK17_WEBHOOK_TOKEN is not set, every push is rejected.\nconst crypto = require('crypto');\nconst item = $input.first();\nconst expected = $env.TRACK17_WEBHOOK_TOKEN || '';\nconst received = String((item.json.query || {}).token || '');\nconst h = s => crypto.createHash('sha256').update(s).digest();\nconst valid = expected.length > 0 && crypto.timingSafeEqual(h(expected), h(received));\nreturn [{ json: { valid, body: valid ? item.json.body : null } }];"
+      }
+    },
+    {
+      "id": "8a2d3e4f-0b22-4c63-8d02-bb0000000002",
+      "name": "Token valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "v1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "8a2d3e4f-0b22-4c63-8d02-bb0000000003",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        660,
+        480
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"error\": \"unauthorized\"}",
+        "options": {
+          "responseCode": 401
+        }
+      }
+    },
+    {
+      "id": "8a2d3e4f-0b22-4c63-8d02-bb0000000004",
+      "name": "Shopify config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2640,
+        540
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cfg1",
+              "name": "shop_domain",
+              "value": "your-store.myshopify.com",
+              "type": "string"
+            },
+            {
+              "id": "cfg2",
+              "name": "api_version",
+              "value": "2026-07",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Webhook 17TRACK Push": {
+      "main": [
+        [
+          {
+            "node": "Verify push token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond OK": {
+      "main": [
+        [
+          {
+            "node": "Extract tracking from push",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract tracking from push": {
+      "main": [
+        [
+          {
+            "node": "17TRACK gettrackinfo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "17TRACK gettrackinfo": {
+      "main": [
+        [
+          {
+            "node": "Extract 17TRACK status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract 17TRACK status": {
+      "main": [
+        [
+          {
+            "node": "Problem status?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Delivered or out for delivery?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Problem status?": {
+      "main": [
+        [
+          {
+            "node": "DT - Look up order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "DT - Look up order": {
+      "main": [
+        [
+          {
+            "node": "Merge data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge data": {
+      "main": [
+        [
+          {
+            "node": "Email present?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email present?": {
+      "main": [
+        [
+          {
+            "node": "DT - Not yet alerted?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Klaviyo - Event": {
+      "main": [
+        [
+          {
+            "node": "DT - Record alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT - Not yet alerted?": {
+      "main": [
+        [
+          {
+            "node": "Build Klaviyo body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Klaviyo body": {
+      "main": [
+        [
+          {
+            "node": "Klaviyo - Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delivered or out for delivery?": {
+      "main": [
+        [
+          {
+            "node": "DT - Look up order (delivery)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT - Look up order (delivery)": {
+      "main": [
+        [
+          {
+            "node": "Merge delivery data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge delivery data": {
+      "main": [
+        [
+          {
+            "node": "Order present?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Order present?": {
+      "main": [
+        [
+          {
+            "node": "DT - Not yet pushed to Shopify?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT - Not yet pushed to Shopify?": {
+      "main": [
+        [
+          {
+            "node": "Shopify config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify Get Token": {
+      "main": [
+        [
+          {
+            "node": "Shopify Get Fulfillments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify Get Fulfillments": {
+      "main": [
+        [
+          {
+            "node": "Build Shopify event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Shopify event": {
+      "main": [
+        [
+          {
+            "node": "Fulfillment found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify POST Event": {
+      "main": [
+        [
+          {
+            "node": "DT - Record Shopify push",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify push token": {
+      "main": [
+        [
+          {
+            "node": "Token valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Token valid?": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify config": {
+      "main": [
+        [
+          {
+            "node": "Shopify Get Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fulfillment found?": {
+      "main": [
+        [
+          {
+            "node": "Shopify POST Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

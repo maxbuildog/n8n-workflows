@@ -1,0 +1,278 @@
+{
+  "name": "Low stock alerts: daily check",
+  "nodes": [
+    {
+      "id": "b2877a0c-4c3b-4673-a54c-60977eb78f28",
+      "name": "Every day 9am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "c305ba57-537d-467d-8b41-454749a73c9c",
+      "name": "Read Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        200,
+        400
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DOCUMENTID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "YOUR_SHEETNAME"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "googleSheetsOAuth2Api"
+        }
+      }
+    },
+    {
+      "id": "ce6e688c-f228-48af-a8a2-6a31ee574d18",
+      "name": "Parse Sheet",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        400
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rows = $input.all().map(i => i.json);\nconst fixedCols = ['Variant', 'Product Name', 'SKU'];\nconst firstRow = rows[0] || {};\nconst allCols = Object.keys(firstRow);\nconst dateCols = allCols.filter(c => !fixedCols.includes(c) && !c.startsWith('_'));\n\nreturn rows.filter(r => r['Product Name']).map(r => {\n  let latestCol = null;\n  let rawValue = null;\n  for (let i = dateCols.length - 1; i >= 0; i--) {\n    const col = dateCols[i];\n    const val = r[col];\n    if (val !== null && val !== undefined && val !== '') {\n      latestCol = col;\n      rawValue = val;\n      break;\n    }\n  }\n  \n  let currentStock = 0;\n  let inProduction = 0;\n  \n  if (typeof rawValue === 'number') {\n    currentStock = Math.floor(rawValue);\n  } else if (typeof rawValue === 'string') {\n    const stockMatch = rawValue.match(/^(\\d+)/);\n    const prodMatch = rawValue.match(/\\((\\d+)\\s*pcs?\\s*in\\s*production\\)/i);\n    if (stockMatch) currentStock = parseInt(stockMatch[1]);\n    if (prodMatch) inProduction = parseInt(prodMatch[1]);\n  }\n  \n  return {\n    json: {\n      product_name_sheet: r['Product Name'],\n      sku: String(r['SKU'] || '').replace(/\\.0$/, ''),\n      current_stock: currentStock,\n      in_production: inProduction,\n      effective_stock: currentStock + inProduction,\n      latest_col: latestCol\n    }\n  };\n});"
+      }
+    },
+    {
+      "id": "ffaf09a3-500a-40fe-97e1-6c48e204a767",
+      "name": "Read DataTable (all)",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        600,
+        400
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DATATABLEID"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "e25d7f3c-9a57-4a5b-86ce-4a3371a6cd3a",
+      "name": "Classify Alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        400
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const dtRows = $input.all().map(i => i.json);\nconst sheetRows = $('Parse Sheet').all().map(i => i.json);\n\nif (dtRows.length === 0) {\n  return [{ json: { redAlerts: [], orangeAlerts: [], total: 0, error: 'DataTable is empty, run the thresholds workflow first', checkedAt: new Date().toISOString() } }];\n}\n\nconst dtBySku = {};\nfor (const r of dtRows) dtBySku[String(r.sku)] = r;\n\nconst redAlerts = [];\nconst orangeAlerts = [];\nlet latestColRef = null;\n\nfor (const s of sheetRows) {\n  const dt = dtBySku[s.sku];\n  if (!dt) continue;\n  if (dt.mode === 'excluded') continue;\n  if (dt.red_threshold == null || dt.orange_threshold == null) continue;\n  const red = Number(dt.red_threshold || 0);\n  const orange = Number(dt.orange_threshold || 0);\n  if (red === 0 && orange === 0) continue;\n  const compareStock = s.effective_stock;\n  const merged = { ...s, ...dt, compare_stock: compareStock };\n  if (s.latest_col) latestColRef = s.latest_col;\n  if (compareStock <= red) redAlerts.push(merged);\n  else if (compareStock <= orange) orangeAlerts.push(merged);\n}\n\nreturn [{ json: { redAlerts, orangeAlerts, total: redAlerts.length + orangeAlerts.length, latestCol: latestColRef, checkedAt: new Date().toISOString() } }];"
+      }
+    },
+    {
+      "id": "784d4816-b411-4a17-95c1-e9fead881dfe",
+      "name": "Alerts?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        400
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.total }}",
+              "operator": {
+                "operation": "gt",
+                "type": "number"
+              },
+              "rightValue": 0
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "12755498-3455-4176-93e9-ff1389ca949f",
+      "name": "Format Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const esc = s => String(s == null ? '' : s).replace(/([_*\\[`])/g, '\\\\$1'); // escape legacy Markdown specials in product names\nconst d = $input.first().json;\nconst red = d.redAlerts || [];\nconst orange = d.orangeAlerts || [];\nconst today = new Date().toLocaleDateString('en-US');\n\nlet text = `🚨 *Low stock alert*, ${today}\\n\\n`;\n\nif (red.length > 0) {\n  text += `🔴 *CRITICAL (${red.length})*\\n━━━━━━━━━━━━━━━━━━\\n`;\n  for (const p of red) {\n    const prod = p.in_production > 0 ? ` (+${p.in_production} in production)` : '';\n    const avg = Number(p.avg_daily_sales_30d || 0).toFixed(1);\n    text += `• *${esc(p.product_name_sheet)}*\\n`;\n    text += `  Stock: ${p.current_stock} units${prod}\\n`;\n    text += `  Red threshold: ${p.red_threshold} | Sales/day: ${avg}\\n`;\n    text += `  ⏰ Order urgently, lead time ${p.lead_time_days} days\\n\\n`;\n  }\n}\n\nif (orange.length > 0) {\n  text += `🟠 *WATCH (${orange.length})*\\n━━━━━━━━━━━━━━━━━━\\n`;\n  for (const p of orange) {\n    const prod = p.in_production > 0 ? ` (+${p.in_production} in production)` : '';\n    const avg = Number(p.avg_daily_sales_30d || 0).toFixed(1);\n    const avgDaily = Number(p.avg_daily_sales_30d || 0);\n    const daysToRed = avgDaily > 0 ? Math.max(0, Math.floor((p.effective_stock - p.red_threshold) / avgDaily)) : 999;\n    text += `• *${esc(p.product_name_sheet)}*\\n`;\n    text += `  Stock: ${p.current_stock} units${prod}\\n`;\n    text += `  Orange threshold: ${p.orange_threshold} | Sales/day: ${avg}\\n`;\n    text += `  📦 In ~${daysToRed} days in the red zone\\n\\n`;\n  }\n}\n\ntext += `━━━━━━━━━━━━━━━━━━\\n`;\nif (d.latestCol) text += `📊 Data as of \"${d.latestCol}\"\\n`;\ntext += `🔄 Next check tomorrow 9am`;\n\nif (text.length > 4000) text = text.substring(0, 3990) + '\\n…(truncated)';\n\nreturn [{ json: { text } }];"
+      }
+    },
+    {
+      "id": "b5959572-e8ad-44f8-b1f0-2574fde021ac",
+      "name": "Telegram alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1400,
+        300
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "telegramApi"
+        }
+      }
+    },
+    {
+      "id": "8a93bbf0-6462-4e93-8a94-e316c58d7b35",
+      "name": "Silence (all clear)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        500
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return [{ json: { result: 'No alerts, staying silent', total: 0, checkedAt: new Date().toISOString() } }];"
+      }
+    }
+  ],
+  "connections": {
+    "Every day 9am": {
+      "main": [
+        [
+          {
+            "node": "Read Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Google Sheet": {
+      "main": [
+        [
+          {
+            "node": "Parse Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Sheet": {
+      "main": [
+        [
+          {
+            "node": "Read DataTable (all)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read DataTable (all)": {
+      "main": [
+        [
+          {
+            "node": "Classify Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Alerts": {
+      "main": [
+        [
+          {
+            "node": "Alerts?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alerts?": {
+      "main": [
+        [
+          {
+            "node": "Format Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Silence (all clear)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Telegram": {
+      "main": [
+        [
+          {
+            "node": "Telegram alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

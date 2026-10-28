@@ -1,0 +1,465 @@
+{
+  "name": "Low stock alerts: thresholds computed from real sales",
+  "nodes": [
+    {
+      "id": "5d5db3dd-339c-44fb-9446-8a3241858a4c",
+      "name": "Every Monday 8am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "f3cdb74a-f227-4dd2-b79a-0634a8846a8e",
+      "name": "Get Shopify token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        200,
+        400
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $('Shopify config').first().json.shop_domain }}/admin/oauth/access_token",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ client_id: $env.SHOPIFY_CLIENT_ID, client_secret: $env.SHOPIFY_CLIENT_SECRET, grant_type: 'client_credentials' }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "f9d32f96-33bb-452b-8c6b-281046d5fa9e",
+      "name": "Read DataTable (dynamic)",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        400,
+        400
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DATATABLEID"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "mode",
+              "condition": "eq",
+              "keyValue": "dynamic"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9a81143a-6800-4c85-a106-c1a07e3310bf",
+      "name": "Init Loop",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        400
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nstaticData.all_line_items = [];\nstaticData.page_count = 0;\nstaticData.total_orders = 0;\nconst sinceIso = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();\nconst cfg = $('Shopify config').first().json;\nconst initialUrl = `https://${cfg.shop_domain}/admin/api/${cfg.api_version}/orders.json?status=any&created_at_min=${encodeURIComponent(sinceIso)}&fields=id,line_items,created_at,canceled_at&limit=250`;\nreturn [{ json: { next_url: initialUrl, all_line_items: [], page_count: 0, total_orders: 0 } }];"
+      }
+    },
+    {
+      "id": "f4bf4243-a231-40b1-b607-37b00646e071",
+      "name": "Fetch Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        800,
+        400
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.next_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Shopify-Access-Token",
+              "value": "={{ $('Get Shopify token').first().json.access_token }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "7d18b449-86a2-4a2d-b71e-c51f999f1303",
+      "name": "Extract + Accumulate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        400
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const input = $input.first().json;\nconst body = input.body || {};\nconst headers = input.headers || {};\nconst orders = body.orders || [];\n\n// The accumulator lives in workflow static data, reset by Init Loop at the start of each run.\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.all_line_items) staticData.all_line_items = [];\nif (!staticData.page_count) staticData.page_count = 0;\nif (!staticData.total_orders) staticData.total_orders = 0;\n\nfor (const order of orders) {\n  if (order.canceled_at) continue;\n  for (const li of (order.line_items || [])) {\n    staticData.all_line_items.push({ product_id: String(li.product_id || ''), quantity: li.quantity || 0 });\n  }\n}\nstaticData.total_orders += orders.length;\nstaticData.page_count += 1;\n\nconst link = headers.link || headers.Link || '';\nconst m = typeof link === 'string' ? link.match(/<([^>]+)>;\\s*rel=\"next\"/) : null;\nconst nextUrl = m ? m[1] : null;\n\nreturn [{ json: { next_url: nextUrl || '', has_more: !!nextUrl && staticData.page_count < 100, page_count: staticData.page_count, total_orders: staticData.total_orders, items_count: staticData.all_line_items.length } }];"
+      }
+    },
+    {
+      "id": "460bf320-f6cb-46e3-844f-4adfde01d302",
+      "name": "Next page?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        400
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.has_more }}",
+              "operator": {
+                "operation": "equals",
+                "type": "boolean"
+              },
+              "rightValue": true
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "cf22aafa-53bd-445e-99e9-1b70399e98d1",
+      "name": "Aggregate & Compute",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        500
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst lineItems = staticData.all_line_items || [];\nconst dtRows = $('Read DataTable (dynamic)').all().map(i => i.json);\n\nif (dtRows.length === 0) return [{ json: { error: 'DataTable empty or no dynamic rows' } }];\n\nconst productIdToSku = {};\nfor (const r of dtRows) {\n  const ids = String(r.shopify_product_ids || '').split(',').map(s => s.trim()).filter(Boolean);\n  for (const id of ids) productIdToSku[id] = r.sku;\n}\n\nconst salesPerSku = {};\nfor (const li of lineItems) {\n  const sku = productIdToSku[li.product_id];\n  if (!sku) continue;\n  salesPerSku[sku] = (salesPerSku[sku] || 0) + li.quantity;\n}\n\nconst meta = { pages: staticData.page_count, total_orders: staticData.total_orders, total_line_items: lineItems.length };\n\n// Clear static data for next run\nstaticData.all_line_items = [];\nstaticData.page_count = 0;\nstaticData.total_orders = 0;\n\nconst daysWindow = 30;\nconst nowIso = new Date().toISOString();\nreturn dtRows.map(r => {\n  const qty = salesPerSku[r.sku] || 0;\n  const avgDaily = qty / daysWindow;\n  const leadTime = Number(r.lead_time_days || 0);\n  const redThreshold = Math.ceil(avgDaily * leadTime * 1.2);\n  const orangeThreshold = Math.ceil(avgDaily * leadTime * 2.0);\n  return {\n    json: {\n      sku: r.sku,\n      product_name_sheet: r.product_name_sheet,\n      shopify_product_ids: r.shopify_product_ids,\n      mode: r.mode,\n      lead_time_days: leadTime,\n      avg_daily_sales_30d: Math.round(avgDaily * 100) / 100,\n      red_threshold: redThreshold,\n      orange_threshold: orangeThreshold,\n      last_calculated_at: nowIso,\n      _meta: { total_qty_30d: qty, ...meta }\n    }\n  };\n});"
+      }
+    },
+    {
+      "id": "0a811ab3-dc75-43a9-92dd-f42521b81c55",
+      "name": "Upsert thresholds",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1600,
+        500
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_DATATABLEID"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "sku",
+              "condition": "eq",
+              "keyValue": "={{ $json.sku }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "sku": "={{ $json.sku }}",
+            "avg_daily_sales_30d": "={{ $json.avg_daily_sales_30d }}",
+            "red_threshold": "={{ $json.red_threshold }}",
+            "orange_threshold": "={{ $json.orange_threshold }}",
+            "last_calculated_at": "={{ $json.last_calculated_at }}"
+          },
+          "matchingColumns": [
+            "sku"
+          ],
+          "schema": [
+            {
+              "id": "sku",
+              "displayName": "sku",
+              "required": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "avg_daily_sales_30d",
+              "displayName": "avg_daily_sales_30d",
+              "required": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "red_threshold",
+              "displayName": "red_threshold",
+              "required": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "orange_threshold",
+              "displayName": "orange_threshold",
+              "required": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "last_calculated_at",
+              "displayName": "last_calculated_at",
+              "required": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": true,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "efea4218-4bf7-4471-950e-c8872f72a6c3",
+      "name": "Format Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        500
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const esc = s => String(s == null ? '' : s).replace(/([_*\\[`])/g, '\\\\$1'); // escape legacy Markdown specials in product names\nconst items = $('Aggregate & Compute').all().map(i => i.json).filter(x => x.sku);\nif (items.length === 0) return [{ json: { text: '📊 Stock thresholds: no dynamic product to recalculate.' } }];\nconst sorted = items.sort((a,b) => (b.avg_daily_sales_30d||0) - (a.avg_daily_sales_30d||0));\nconst lines = sorted.map(r => `• *${esc(r.product_name_sheet)}*: 🟠 ${r.orange_threshold} / 🔴 ${r.red_threshold} (${(r.avg_daily_sales_30d||0).toFixed(1)} units/day)`);\nconst meta = sorted[0] && sorted[0]._meta ? sorted[0]._meta : null;\nlet text = `📊 *Stock thresholds recalculated*, ${new Date().toLocaleDateString('en-US')}\\n\\n${lines.join('\\n')}`;\nif (meta) text += `\\n\\n_${meta.total_orders} orders / ${meta.total_line_items} line items over 30 days (${meta.pages} pages)_`;\nif (text.length > 4000) text = text.substring(0, 3990) + '\\n…(truncated)';\nreturn [{ json: { text } }];"
+      }
+    },
+    {
+      "id": "c3aa8b0e-5981-48f9-bf65-2cc576fed392",
+      "name": "Telegram recap",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2000,
+        500
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "telegramApi"
+        }
+      }
+    },
+    {
+      "id": "5c1d7b0e-2a64-4f0e-9c55-3f6b8e1a7d10",
+      "name": "Shopify config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        60,
+        400
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cfg1",
+              "name": "shop_domain",
+              "value": "your-store.myshopify.com",
+              "type": "string"
+            },
+            {
+              "id": "cfg2",
+              "name": "api_version",
+              "value": "2026-07",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Every Monday 8am": {
+      "main": [
+        [
+          {
+            "node": "Shopify config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Shopify token": {
+      "main": [
+        [
+          {
+            "node": "Read DataTable (dynamic)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read DataTable (dynamic)": {
+      "main": [
+        [
+          {
+            "node": "Init Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Loop": {
+      "main": [
+        [
+          {
+            "node": "Fetch Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Page": {
+      "main": [
+        [
+          {
+            "node": "Extract + Accumulate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract + Accumulate": {
+      "main": [
+        [
+          {
+            "node": "Next page?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Next page?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Page",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Aggregate & Compute",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate & Compute": {
+      "main": [
+        [
+          {
+            "node": "Upsert thresholds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert thresholds": {
+      "main": [
+        [
+          {
+            "node": "Format Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Telegram": {
+      "main": [
+        [
+          {
+            "node": "Telegram recap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify config": {
+      "main": [
+        [
+          {
+            "node": "Get Shopify token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,130 @@
+{
+  "name": "Store Chat - Session Cleanup",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 3 * * *"
+            }
+          ]
+        }
+      },
+      "id": "e62304f0-074f-4dc2-8cc3-25ad13415f20",
+      "name": "Daily at 3am",
+      "position": [
+        240,
+        304
+      ],
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- 1) Delete rows older than the retention period (needs the created_at column, see the README).\nDELETE FROM chatbot_memory\nWHERE created_at < NOW() - INTERVAL '{{ Number($json.retention_days) }} days';\n\n-- 2) Safety cap: keep only the most recent rows. Ids are ranked newest first,\n-- everything after the first max_rows is deleted.\nDELETE FROM chatbot_memory\nWHERE id IN (\n  SELECT id FROM chatbot_memory\n  ORDER BY id DESC\n  OFFSET {{ Number($json.max_rows) }}\n);\n\nSELECT\n  (SELECT COUNT(*) FROM chatbot_memory) AS rows_remaining,\n  NOW() AS cleanup_date;",
+        "options": {}
+      },
+      "id": "7b01a588-24be-488c-8a67-6d7dd31210af",
+      "name": "Delete Expired Sessions",
+      "position": [
+        700,
+        304
+      ],
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $input.first().json;\nconsole.log(`Cleanup chatbot_memory: ${result.rows_remaining} rows remaining on ${result.cleanup_date}`);\nreturn [{ json: { rows_remaining: result.rows_remaining, cleanup_date: result.cleanup_date, status: 'success' } }];"
+      },
+      "id": "df3c8ab8-53e8-4d59-8cf0-03d1952b2013",
+      "name": "Log Result",
+      "position": [
+        940,
+        304
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "dd324fd6-824d-4d48-b756-4d048ae277c5",
+              "name": "retention_days",
+              "value": 30,
+              "type": "number"
+            },
+            {
+              "id": "06e03032-07e2-4b52-9fcb-32cbfb4d040b",
+              "name": "max_rows",
+              "value": 10000,
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "566fc1ec-8783-42ba-9f0d-515f66429875",
+      "name": "Retention Settings",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        460,
+        304
+      ]
+    }
+  ],
+  "connections": {
+    "Daily at 3am": {
+      "main": [
+        [
+          {
+            "node": "Retention Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retention Settings": {
+      "main": [
+        [
+          {
+            "node": "Delete Expired Sessions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Expired Sessions": {
+      "main": [
+        [
+          {
+            "node": "Log Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

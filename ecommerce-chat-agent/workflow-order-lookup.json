@@ -1,0 +1,208 @@
+{
+  "name": "Store Chat - Order Status Lookup",
+  "nodes": [
+    {
+      "id": "47ab92b9-9474-44b4-ab6d-4796cf6eb745",
+      "name": "Shopify Orders by Number",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        420
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "method": "GET",
+        "url": "=https://{{ $json.shop_domain }}/admin/api/{{ $json.shopify_api_version }}/orders.json?name={{ encodeURIComponent($json.body.order_number || $json.body[''] || '') }}&status=any&fields=name,email,created_at,financial_status,fulfillment_status,fulfillments,line_items",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "httpHeaderAuth"
+        }
+      }
+    },
+    {
+      "id": "57ee2b3b-0426-4de2-9198-7f53116c9085",
+      "name": "No Info",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        600
+      ],
+      "parameters": {
+        "jsCode": "return [{json:{found:false,result:\"Both the order number (for example #1234) and the email address used for the order are required. Ask the customer for the one that is missing.\"}}];"
+      }
+    },
+    {
+      "id": "ad788c4c-76d4-40ac-9f4f-ca68cd0564bc",
+      "name": "Verify and Format",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        420
+      ],
+      "parameters": {
+        "jsCode": "const orders = $json.orders || [];\nconst body = $('Orders Webhook').item.json.body || {};\nconst requestedEmail = (body.email || '').toString().toLowerCase().trim();\nconst requestedNumber = (body.order_number || body[''] || '').toString().trim();\n\n// Neutral answer: identical whether the order does not exist or the details do not match.\nconst noMatch = [{ json: {\n  found: false,\n  result: \"No matching order for these details. Ask the customer to check the order number and the email address.\"\n}}];\n\nconst normalize = v => (v || '').toString().trim().replace(/^#/, '').toLowerCase();\n\n// Both identifiers must match the same order, otherwise nothing is disclosed.\nconst o = orders.find(x =>\n  normalize(x.name) === normalize(requestedNumber) &&\n  requestedEmail !== '' &&\n  (x.email || '').toString().toLowerCase().trim() === requestedEmail\n);\nif (!o) return noMatch;\n\nconst fulfillments = o.fulfillments || [];\nconst trackingNumbers = fulfillments.flatMap(f =>\n  (f.tracking_numbers && f.tracking_numbers.length > 0) ? f.tracking_numbers : (f.tracking_number ? [f.tracking_number] : [])\n).filter(Boolean);\nconst trackingUrls = fulfillments.flatMap(f =>\n  (f.tracking_urls && f.tracking_urls.length > 0) ? f.tracking_urls : (f.tracking_url ? [f.tracking_url] : [])\n).filter(Boolean);\nconst carriers = [...new Set(fulfillments.map(f => f.tracking_company).filter(Boolean))];\n\n// Data minimization: no name, no address, no phone, no email is returned to the model.\nconst formatted = {\n  name: o.name,\n  created_at: o.created_at,\n  created_at_display: new Date(o.created_at).toLocaleDateString('en-US'),\n  days_since_order: Math.floor((Date.now() - new Date(o.created_at).getTime()) / 86400000),\n  financial_status: o.financial_status,\n  fulfillment_status: o.fulfillment_status || 'unfulfilled',\n  carriers,\n  tracking_numbers: trackingNumbers,\n  tracking_urls: trackingUrls,\n  items: (o.line_items || []).map(i => ({ name: i.name, qty: i.quantity }))\n};\n\nconst statusLabels = {'pending':'Pending','paid':'Paid','refunded':'Refunded','voided':'Voided','partially_refunded':'Partially refunded'};\nconst fulfLabels = {'unfulfilled':'Being prepared','fulfilled':'Shipped','partial':'Partially shipped'};\nconst s = statusLabels[formatted.financial_status] || formatted.financial_status;\nconst f = fulfLabels[formatted.fulfillment_status] || 'Being prepared';\nconst it = formatted.items.map(i => `${i.name} x${i.qty}`).join(', ');\nconst result = `${formatted.name} - ${formatted.created_at_display}\\nProducts: ${it}\\nPayment: ${s}\\nShipping: ${f}`\n  + (carriers.length ? `\\nCarrier: ${carriers.join(', ')}` : '')\n  + (trackingNumbers.length ? `\\nTracking: ${trackingNumbers.join(', ')}` : '')\n  + (trackingUrls.length ? `\\nLink: ${trackingUrls[0]}` : '');\n\nreturn [{ json: { found: true, order: formatted, result } }];\n"
+      }
+    },
+    {
+      "id": "2eada750-3358-474d-856f-28abff7dbd0c",
+      "name": "Orders Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        100
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "order-status-lookup",
+        "responseMode": "lastNode",
+        "options": {},
+        "authentication": "headerAuth"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "Order lookup webhook auth"
+        }
+      }
+    },
+    {
+      "id": "8640c2bf-3dc5-4464-9c64-34aea5c4fe21",
+      "name": "Require Both Fields",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "email-notempty",
+              "leftValue": "={{ (($json.body && $json.body.email) || '').toString().trim() }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "number-notempty",
+              "leftValue": "={{ (($json.body && ($json.body.order_number || $json.body[''])) || '').toString().trim() }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b6c9e898-c95a-4208-a572-474c7820f8f0",
+              "name": "shop_domain",
+              "value": "your-store.myshopify.com",
+              "type": "string"
+            },
+            {
+              "id": "adb20d1a-9638-45de-8279-68d95ecde11f",
+              "name": "shopify_api_version",
+              "value": "2026-07",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "68665f96-f56a-4d50-a7eb-c1d6af46ec41",
+      "name": "Settings",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        680,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Orders Webhook": {
+      "main": [
+        [
+          {
+            "node": "Require Both Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Require Both Fields": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify Orders by Number": {
+      "main": [
+        [
+          {
+            "node": "Verify and Format",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Shopify Orders by Number",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

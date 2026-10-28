@@ -1,0 +1,2199 @@
+{
+  "name": "AI email support agent (Gmail + Shopify + knowledge base)",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// ===== CONFIGURATION: the single place for store-specific values =====\n// Everything below is copied onto each email item, so later nodes (classifier, agent prompt, parser, SQL) read it from there.\nconst STORE_NAME = 'Example Store';\nconst SUPPORT_EMAIL = 'support@example.com';\nconst STORE_URL = 'https://example.com';\nconst TRACKING_PAGE_URL = 'https://example.com/pages/track-your-order';   // the agent may add ?tracking=NUMBER\nconst ACCOUNT_URL = 'https://example.com/account';\nconst SIGNATURE = 'Kind regards,\\nThe Example Store support team';       // end of every draft, before the AI disclosure line\nconst OWN_DOMAINS = ['example.com'];                                      // the store's own sending domains, no \"@\". Replace with yours.\nconst DEFAULT_LANGUAGE = 'en';                                            // ISO code. Other languages go to the \"to validate\" label.\nconst CONFIDENCE_THRESHOLD = 0.7;                                         // below this, a draft is never green (read by the prompt, the parser and the unanswered log)\nconst MEMORY_RETENTION_DAYS = 365;                                        // customer memory older than this is ignored and purged by Read Support Memory\n// ===== END CONFIGURATION =====\n\n// Gmail \"Get Many\" returns messages already parsed. Code runs once for all items: we iterate.\nreturn $input.all().map(({ json: item }) => {\n  const fromEmail = (item.from?.value?.[0]?.address || '').toLowerCase();\n  const fromName = item.from?.value?.[0]?.name || '';\n  const subject = item.subject || '';\n  const body = (item.text || (item.textAsHtml ? item.textAsHtml.replace(/<[^>]+>/g, ' ') : '')).trim().slice(0, 8000);\n  const receivedAt = item.date ? new Date(item.date).toISOString() : new Date().toISOString();\n  const attachmentsList = Array.isArray(item.attachments) ? item.attachments : [];\n  const attachmentMimes = attachmentsList.map(a => a.contentType || a.mime || '').filter(Boolean);\n  return {\n    json: {\n      message_id: item.id,\n      thread_id: item.threadId,\n      from_email: fromEmail,\n      from_name: fromName,\n      subject,\n      body,\n      received_at: receivedAt,\n      has_attachments: attachmentsList.length > 0,\n      attachment_mimes: attachmentMimes,\n      has_video: attachmentMimes.some(m => m.startsWith('video/')),\n      store_name: STORE_NAME,\n      support_email: SUPPORT_EMAIL,\n      store_url: STORE_URL,\n      tracking_page_url: TRACKING_PAGE_URL,\n      account_url: ACCOUNT_URL,\n      signature: SIGNATURE,\n      own_domains: OWN_DOMAINS,\n      default_language: DEFAULT_LANGUAGE,\n      confidence_threshold: CONFIDENCE_THRESHOLD,\n      memory_retention_days: MEMORY_RETENTION_DAYS\n    }\n  };\n});\n"
+      },
+      "id": "aca7936a-f3ca-4163-a4c0-b4f14a300e83",
+      "name": "Extract email data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        32
+      ],
+      "notes": "Flattens each Gmail message and copies the store configuration (name, signature, own domains, language, confidence threshold, memory retention) onto the item. Edit the CONFIGURATION block at the top."
+    },
+    {
+      "parameters": {
+        "model": "gpt-4.1-mini",
+        "options": {
+          "maxTokens": 2500,
+          "temperature": 0.3
+        }
+      },
+      "id": "a433c586-c232-419b-a3ba-59ddde3759bf",
+      "name": "Chat model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [
+        3136,
+        160
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_ME",
+          "name": "openAiApi"
+        }
+      },
+      "notes": "Any OpenAI-compatible chat model. Change the model name here; to use another OpenAI-compatible provider, add the Base URL option on this node. Use a currently supported model. Pick a provider that offers a data processing agreement and a suitable region (see README, Privacy)."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Email type: {{ $json.non_support_category ? 'automatic notification (' + $json.non_support_category + ')' : 'customer email' }}\n\nFrom (name): {{ $json.from_name }}\nSubject: {{ $json.subject }}\nReceived: {{ $json.received_at }}\nAttachments: {{ $json.has_attachments ? $json.attachment_mimes.join(', ') : 'none' }}\nVideo attached: {{ $json.has_video }}\n\n{{ $json.has_memory ? $json.client_memory + '\\n\\n' : '' }}{{ $json.thread_history_count > 0 ? 'THREAD HISTORY (' + $json.thread_history_count + ' previous messages):\\n---\\n' + $json.thread_history + '\\n---\\n\\n' : '' }}Email body:\n---\n{{ $json.body }}\n---\n\nProcess this email according to your mission. Reply ONLY with strict JSON.",
+        "options": {
+          "systemMessage": "=You are the email support assistant of {{ $json.store_name }} (support address: {{ $json.support_email }}). You take NO action with business impact. You read the customer's email, classify it, consult your tools, and write ONE DRAFT for a human reviewer. The reviewer carries out any concrete action (refund, replacement, discount code, address change) and decides whether the reply is sent.\n\n## TOOLS: CONSULT BEFORE WRITING\n- kb2_playbook (operating playbook): consult it for tone, reply templates, the goodwill scale, the format of the reviewer note and the label rules.\n- kb1_facts (facts): consult it for products, prices, warranty and return terms, delivery conditions, privacy contacts and how-to answers.\n- shopify_orders: a read-only lookup of the orders placed with the sender's own email address. The address is fixed by the system, you cannot change it. You may pass order_number only if the customer wrote one. Call it at most once per email, as soon as the customer mentions an order, a delivery or a parcel. Do not call it for automatic notifications (see \"Email type\" in the input).\n- tracking17_tool: consult it only after shopify_orders returned an order with a tracking number. Pass exactly {\"tracking_number\":\"TRACKING_NUMBER\"}, no other field name.\n\nNever state a fact (price, term, deadline, policy, product detail, order data, tracking status) that is not literally present in a tool response or in the email itself. If the knowledge base does not cover the question, say so in the reviewer note and use label 🔵. Never invent a URL: use only links found in the knowledge base, {{ $json.tracking_page_url }} for tracking (add ?tracking=NUMBER when you have one) and {{ $json.account_url }} for the customer account page.\n\n## SHOPIFY_ORDERS\nResponse: found, count, orders[] (at most 5, most recent first). Each order has: name, created_at_local, days_since_order, financial_status, fulfillment_status, items[], tracking_numbers[], tracking_urls[]. It has no address and no customer name.\n- found:false means there is nothing to cite. Never write \"your order #X\" or \"shipped on X\" in that case.\n- Quote order data literally: the name with its #, the date (an exact date once days_since_order is 2 or more), tracking numbers and URLs as returned. Never promise tracking from a number that is not in tracking_numbers[].\n- Several orders: take the one matching the number written in the email, otherwise orders[0]; if none fits, use label 🔵.\n- If tracking_numbers is empty on a shipped order, say the tracking number is not available yet and will be sent once issued.\nORDER NOT FOUND OR NOT VERIFIED: one trigger is enough: found:false; a number in the email that matches no orders[].name (compare with and without #); a product named in the email that is absent from all items[]. In that case the draft quotes no number, date, product or tracking, politely asks the customer to confirm the order number and the email address used when ordering (the lookup only sees orders placed with the address the email came from), the label is 🔵, and the reviewer note says what did not match.\n\n## TRACKING\nOnly when the customer asks where the parcel is, and only with a tracking number taken from the chosen order. One call per email.\n- Quote only the latest status the tool returns, in plain words, without extrapolation. Delivered means delivered.\n- No usable event yet: say the order has shipped and the carrier has not reported an update.\n- Not found, expired or technical error: say the exact position cannot be confirmed for now, and share the tracking number.\n\n## MISSION\n1. Classify. category is one of: delivery, product-issue, return-refund, account, partnership, product-question, thanks-satisfaction, privacy-request, legal, safety-health, other. emotional_level goes from 1 (calm) to 4 (very angry or threatening). language is an ISO code. confidence goes from 0 to 1.\n2. Write the draft in the customer's language.\n3. Choose the label (below, and the playbook).\n4. Write a reviewer note (note_block) when the label is 🟡, 🔴 or 🔵.\n\nLABELS\n- 🟢 handled: thanks, simple information, a tracking status you verified. No commitment of any kind.\n- 🟡 action needed: any refund, replacement, reshipment, cancellation, address change or discount code to create. You never decide these alone.\n- 🔵 to validate: order not found or not verified; language other than {{ $json.default_language }} (the reviewer checks the translation); confidence below {{ $json.confidence_threshold }}; a question the knowledge base does not cover.\n- 🔴 urgent: see escalations.\n- Partnerships: a business proposal. draft_body is null, no reply.\n\n## ESCALATIONS (label 🔴, no emoji in the draft, sober tone, no promise)\n- Legal threat (lawyer, court, authority, formal complaint, legal proceedings): category legal. The note starts with \"LEVEL 4: legal threat detected\". Careful draft: empathy, ask for the order number and the circumstances, no admission of liability, no promise of refund or replacement.\n- Safety or health concern (a person was hurt or feels unwell, or the product seems unsafe): category safety-health. Never answer on the merits, never minimize or dismiss it, never give medical or technical advice. Express concern, ask for the order number and details, and say that a member of the team will follow up personally. The note says the case must be read by a human immediately and the product should not be reshipped before review.\n- Request about personal data (access, copy, correction, deletion, objection, withdrawal of consent, or a mention of a privacy law): category privacy-request. Do not disclose, confirm or discuss any personal data in the draft and do not promise a deletion. Acknowledge the request, say a team member will handle it within the legal deadline, and give the privacy contact from the knowledge base if there is one. The note tells the reviewer to verify the requester's identity and follow the data request procedure.\n- Very unhappy customer (emotional_level 4) or a payment dispute: escalate the same way.\n- Chat tool alert (input Email type says \"chat_tool\"): the reply goes through the chat tool, not by email. draft_body is a short reply (40 to 80 words) to copy and paste, addressed to the customer by first name as given in the alert, with no email signature. note_block: \"📋 CONTEXT: chat tool alert, customer [NAME], last message: ...\" then \"⚙️ ACTIONS TO DO (reviewer): reply in the chat tool\" then \"🔗 LINKS: conversation link\".\n- Low-rating review notification (input Email type says \"reviews\"): a human contacts the customer privately. Draft a short, sober private message. Never ask the customer to change or remove the review.\n\n## WARRANTY, RETURNS, GOODWILL\nState warranty and return terms only as written in the knowledge base, including the statutory consumer rights that apply in the customer's country. Never invent a term, never present a legal right as optional, never refuse to mention any warranty you offer and the statutory rights that apply in the customer's country.\n- Product problem: ask once for what is needed (order number if not found, a short description, a photo or video), then label 🟡 with a note proposing the next step from the knowledge base and the playbook. No promise of replacement or refund before the reviewer validates.\n- Outside the standard warranty period: explain what the knowledge base says, including statutory rights if they apply, and label 🟡.\n- Return: give the return conditions and address as written in the knowledge base. Label 🟡.\n- Goodwill gesture: only one the playbook lists, and only for a clearly unhappy customer (emotional_level 3 or more), a long unresolved wait or a repeated complaint. By default offer none. For a code that must be created, write [PERSONALIZED CODE TO BE CREATED BY THE REVIEWER]. Quote an existing code only if the playbook lists it.\n- Delivery times and refund times: only as written in the knowledge base. If the knowledge base gives none, say you will come back with the information and use label 🔵.\n- Never ask for, or mention, a product review. The system handles that, if the store enabled it.\n\n## STYLE (the playbook tone rules apply; this section wins in case of conflict)\n- 60 to 120 words, short paragraphs, one idea per sentence, one request per email. No list except to enumerate what you ask for.\n- Use \"we\", never \"I\". Polite and plain. At most one \"!\" and only for good news. No emoji on a 🔴 label. No em dashes.\n- Opening: \"Hello [First name],\" (or \"Hello,\" if the name is unknown) then \"Thank you for your message.\" For a serious situation, go straight to the apology or the fact.\n- Then the verified fact, then the action or ONE precise request. At most one apology sentence.\n- Never ask again for information already given in the thread or in the memory. Look up the order before asking.\n- Close with exactly this signature:\n{{ $json.signature }}\n- A transparency line saying that an AI assistant was involved is added by the system after your signature. Do not write it yourself. If the customer asks whether they are talking to a person or a machine, answer honestly that the reply was drafted by an AI assistant and reviewed by the team.\n\n## DATA MINIMIZATION\nThe one-line summary is stored in a customer memory kept for {{ $json.memory_retention_days }} days. Write it without address, phone number, payment details, health details or any other sensitive data: only the topic and the outcome.\n\n## REVIEWER NOTE (note_block)\nThe reviewer cannot see the knowledge bases: never cite \"KB1\", \"KB2\", a section or a template number. Write plain actions, as to a colleague.\n📋 CONTEXT: factual summary and relevant thread history\n⚙️ ACTIONS TO DO (reviewer): clear list (\"ship X\", \"create a personalized code\", \"contact the carrier\")\n🔗 LINKS: order number, tracking, useful items\n\n## OUTPUT FORMAT (STRICT JSON, NO markdown, no text around it)\n{\n  \"category\": \"\",\n  \"emotional_level\": 1,\n  \"language\": \"{{ $json.default_language }}\",\n  \"confidence\": 0.9,\n  \"label\": \"🟢\",\n  \"draft_subject\": \"Re: ...\",\n  \"draft_body\": \"...\",\n  \"note_block\": null,\n  \"shopify_order_number\": null,\n  \"summary\": \"1 line\"\n}",
+          "maxIterations": 18
+        }
+      },
+      "id": "f67950da-88f8-4d91-b5ff-c68c8819875c",
+      "name": "Support Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        3568,
+        -64
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "The system prompt is an expression: store name, signature, language, threshold and retention are read from the item (set in Extract email data). The sender address is not shown to the model."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== CONFIGURATION =====\n// Language, confidence threshold and signature come from Extract email data (single place). Everything else is here.\nconst ALLOWED_PROMO = new Set(['EXAMPLE10', 'EXAMPLE20']);   // codes the agent may quote without review: keep identical to the codes in your playbook (KB2)\nconst MAX_AUTO_DISCOUNT_PERCENT = 20;                         // a green draft quoting more is downgraded\nconst ESCALATION_CATEGORIES = ['chat_tool', 'reviews'];       // non-support categories forced to red when flagged upstream\nconst FORCE_RED_CATEGORIES = ['legal', 'safety-health', 'privacy-request'];   // categories the model may return that are always red\nconst FORCE_RED_EMOTIONAL_LEVEL = 4;                          // emotional_level at or above this is always red\n// Deterministic detection on the customer's email, independent of the model. Case-insensitive regular expressions (as strings).\nconst LEGAL_PATTERNS = ['\\\\b(lawyer|attorney|solicitor|barrister|lawsuit|legal action|legal proceedings|small claims|take you to court|see you in court|sue you|sue the company|consumer protection (?:agency|authority|office)|trading standards|regulator)\\\\b'];\nconst SAFETY_HEALTH_PATTERNS = ['\\\\b(injur(?:y|ed|ies)|hospital|emergency room|ambulance|poison(?:ed|ing)?|unsafe|dangerous|hazard(?:ous)?|allergic|medical attention|my doctor|health (?:problem|issue|concern|risk)|safety (?:problem|issue|concern|risk))\\\\b'];\nconst PRIVACY_PATTERNS = ['\\\\b(gdpr|ccpa|data protection|personal data|personal information|right to be forgotten|data subject|erase my (?:data|account)|delete my (?:data|account|information)|copy of my (?:data|information)|access to my (?:data|information)|stop processing my|withdraw my consent)\\\\b'];\nconst AUTO_SEND_ENABLED = false;   // MASTER TOGGLE. false: every reply stays a draft for a human. Read the README before changing it.\nconst AUTO_SEND_CATEGORIES = new Set(['thanks-satisfaction', 'account']);\n// Transparency: every customer-facing draft ends with a line saying an AI assistant was involved.\n// Keyed by ISO language code; 'en' is the fallback. Add the languages you serve.\nconst AI_DISCLOSURE_ENABLED = true;\nconst AI_DISCLOSURE_DRAFT = { en: 'This reply was drafted by an AI assistant and reviewed by our team.' };   // used when a human reviews before sending\nconst AI_DISCLOSURE_AUTO = { en: 'This reply was written by an AI assistant.' };                             // used if you enable auto-send (nobody reviews)\n// Review invitation: OFF by default. When enabled, the SAME neutral line is appended to every non-red draft,\n// whatever the customer's mood or the outcome of the conversation (never filtered on satisfaction).\nconst REVIEW_INVITE_ENABLED = false;\nconst REVIEW_INVITE_TEXT = 'If you would like to share your experience of our store, you can leave a review here: https://example.com/reviews';\n// ===== END CONFIGURATION =====\nconst asRegexes = (list) => list.map(p => new RegExp(p, 'i'));\nconst LEGAL_RES = asRegexes(LEGAL_PATTERNS);\nconst SAFETY_RES = asRegexes(SAFETY_HEALTH_PATTERNS);\nconst PRIVACY_RES = asRegexes(PRIVACY_PATTERNS);\nconst pickByLanguage = (map, lang) => map[String(lang || '').toLowerCase().slice(0, 2)] || map.en || '';\nconst append = (note, extra) => (note ? note + '\\n\\n' : '') + extra;\n\nconst inputs = $input.all();\n// Use Merge Memory so that indexes line up with what the agent REALLY processed\nconst extractItems = $('Merge Memory').all();\n\nreturn inputs.map((inp, i) => {\n  const mail = extractItems[i]?.json || {};\n  const DEFAULT_LANGUAGE = mail.default_language || 'en';\n  const CONFIDENCE_THRESHOLD = typeof mail.confidence_threshold === 'number' ? mail.confidence_threshold : 0.7;\n  const raw = inp.json.output || inp.json.text || '';\n  const isMaxIterFail = /Agent stopped due to max iterations/i.test(raw);\n  let parsed;\n  try {\n    if (isMaxIterFail) throw new Error('max iterations');\n    let cleaned = raw;\n    const fenced = raw.match(/```json\\s*([\\s\\S]*?)\\s*```/i);\n    if (fenced) {\n      cleaned = fenced[1].trim();\n    } else {\n      const jsonBlock = raw.match(/\\{[\\s\\S]*\\}/);\n      if (jsonBlock) cleaned = jsonBlock[0];\n    }\n    parsed = JSON.parse(cleaned);\n  } catch (e) {\n    if (isMaxIterFail) {\n      parsed = {\n        category: 'other', emotional_level: 3, language: DEFAULT_LANGUAGE, confidence: 0.0,\n        label: '🔴',\n        draft_subject: 'Re: ' + (mail.subject || ''),\n        draft_body: null,\n        note_block: '⚠️ MAX ITERATIONS: the agent did not converge on an answer for this message.\\n\\n📋 CONTEXT: handle this email manually. Read it, look up the order if one is mentioned, and reply yourself.\\n\\n⚙️ ACTIONS TO DO (reviewer): (1) ignore the empty note draft, (2) answer the customer manually, (3) if this keeps happening on this thread, archive it to stop the loop.',\n        shopify_order_number: null,\n        summary: 'Agent max iterations: escalated to the reviewer',\n        is_max_iter_fail: true\n      };\n    } else {\n      parsed = {\n        category: 'other', emotional_level: 2, language: DEFAULT_LANGUAGE, confidence: 0.0,\n        label: '🟡',\n        draft_subject: 'Re: ' + (mail.subject || ''),\n        draft_body: null,\n        note_block: '⚠️ TO CHECK\\nReason: the agent output could not be parsed, so there is no reliable draft.\\n\\n📋 CONTEXT:\\nFrom: ' + (mail.from_name || '') + ' <' + (mail.from_email || '') + '>\\nSubject: ' + (mail.subject || '') + '\\nEmail preview: ' + ((mail.body || '').slice(0, 700)) + '\\n\\n⚙️ ACTIONS TO DO (reviewer): read the email, check the order if one is mentioned, then write the reply manually.\\n\\nRaw agent output (first 500 characters):\\n' + raw.slice(0, 500),\n        shopify_order_number: null,\n        summary: 'Agent parsing failed',\n        is_max_iter_fail: false\n      };\n    }\n  }\n  if (parsed.is_max_iter_fail === undefined) parsed.is_max_iter_fail = false;\n  const VALID_LABELS = new Set(['🔴', '🟡', '🔵', '🟢', 'Partnerships']);\n  if (!VALID_LABELS.has(parsed.label)) {\n    parsed.note_block = append(parsed.note_block, '⚠️ The label \"' + parsed.label + '\" is not in the list: forced to 🔵 to validate.');\n    parsed.label = '🔵';\n  }\n\n  // --- DETERMINISTIC ESCALATION 1: chat tool alert / negative review ---\n  // requires_support_escalation is computed upstream by Classify Non-Support Email, deterministically.\n  // Reset support labels removes the urgent label that Apply Non-Support Labels put on earlier,\n  // so the red label is forced here: the final label does not depend on the model.\n  if (mail.requires_support_escalation === true && ESCALATION_CATEGORIES.includes(String(mail.non_support_category || '').toLowerCase())) {\n    parsed.label = '\\u{1F534}';\n    parsed.note_block = append(parsed.note_block, '⚠️ AUTOMATIC ESCALATION: ' + (mail.escalation_reason || 'human intervention required') + '. Red label forced by the system, do not downgrade.');\n  }\n\n  // --- DETERMINISTIC ESCALATION 2: legal threat, safety or health concern, personal data request, very unhappy customer ---\n  // Detected from the model's category and emotional level AND from patterns on the customer's own words.\n  const clientText = (mail.subject || '') + '\\n' + (mail.body || '');\n  const forcedReasons = [];\n  if (parsed.label !== 'Partnerships' && LEGAL_RES.some(r => r.test(clientText))) forcedReasons.push('possible legal threat');\n  if (SAFETY_RES.some(r => r.test(clientText))) forcedReasons.push('possible safety or health concern');\n  if (PRIVACY_RES.some(r => r.test(clientText))) forcedReasons.push('possible personal data request');\n  if (FORCE_RED_CATEGORIES.includes(String(parsed.category || '').toLowerCase())) forcedReasons.push('category ' + parsed.category);\n  if (Number(parsed.emotional_level) >= FORCE_RED_EMOTIONAL_LEVEL) forcedReasons.push('very unhappy customer (level ' + parsed.emotional_level + ')');\n  if (forcedReasons.length > 0 && parsed.label !== '\\u{1F534}') {\n    parsed.label = '\\u{1F534}';\n    parsed.note_block = append(parsed.note_block, '⚠️ AUTOMATIC ESCALATION: ' + forcedReasons.join(', ') + '. Red label forced by the system: a human must read this email before anything is sent.');\n  }\n\n  // --- CONFIDENCE: a green draft below the threshold goes to \"to validate\" ---\n  const conf = Number(parsed.confidence);\n  if (parsed.label === '\\u{1F7E2}' && !(conf >= CONFIDENCE_THRESHOLD)) {\n    parsed.label = '\\u{1F535}';\n    parsed.note_block = append(parsed.note_block, '⚠️ LOW CONFIDENCE: the agent reported ' + (Number.isNaN(conf) ? 'no confidence value' : 'confidence ' + conf) + ', below the threshold of ' + CONFIDENCE_THRESHOLD + '. Moved to \"to validate\".');\n  }\n\n  // --- GUARDRAILS: prevent some cases from going out as green ---\n  if (parsed.label === '\\u{1F7E2}' && parsed.draft_body) {\n    const bodyText = parsed.draft_body;\n    const promoCodes = (bodyText.match(/\\b[A-Z]{3,}\\d{1,3}(?:-[A-Z0-9]+)?\\b/g) || []);\n    const hasUnauthorizedCode = promoCodes.some(c => !ALLOWED_PROMO.has(String(c).toUpperCase().split('-')[0]));\n    const discounts = (bodyText.match(/-\\s?\\d{1,3}\\s?%/g) || []).concat(bodyText.match(/\\d{1,3}\\s?%\\s*(?:off|discount|reduction)/gi) || []);\n    const tooHighDiscount = discounts.some(d => parseInt(String(d).replace(/\\D/g, ''), 10) > MAX_AUTO_DISCOUNT_PERCENT);\n    // Commitment detection: refund, reshipment/replacement, cancellation, exchange, address change. Extend for your policies.\n    const refundRe = /(will (?:process|issue) (?:a|your|the) refund|we (?:will )?refund|your refund|refund (?:will be|has been|is|of\\b)|refunded (?:within|in))/i;\n    const replaceRe = /(replacement (?:product|item|order)|replacement of your|re-?ship|we (?:will )?(?:send|ship) (?:you )?(?:a|the|your) (?:new|replacement)|new order will be (?:re-?)?shipped)/i;\n    const actionRe = /(cancel|terminat|unsubscrib|withdraw|refund|replace|re-?ship|resend|return (?:the|my|your|this|a)\\b|make a return|exchange (?:the|my|your|this)|(?:change|modify)[^.]{0,25}(?:address|order|delivery|subscription))/i;\n    const isEngagement = refundRe.test(bodyText) || replaceRe.test(bodyText) || actionRe.test(bodyText) || actionRe.test(clientText) || parsed.category === 'return-refund';\n    if (hasUnauthorizedCode || tooHighDiscount) {\n      parsed.label = '\\u{1F7E1}';\n      parsed.note_block = append(parsed.note_block, '⚠️ PROMO GUARDRAIL: code or discount outside what can go out without review (only the codes in ALLOWED_PROMO and discounts up to MAX_AUTO_DISCOUNT_PERCENT are accepted as green). Downgraded to yellow: the reviewer must check or create the code before sending.');\n    } else if (isEngagement) {\n      parsed.label = '\\u{1F7E1}';\n      parsed.note_block = append(parsed.note_block, '⚠️ SUPPORT GUARDRAIL: the reply contains a commitment (refund, reshipment, replacement, cancellation or change). Downgraded to yellow: the reviewer must carry out and confirm the action before sending.');\n    }\n  }\n\n  // --- AUTO-SEND toggle (constants at the top) ---\n  parsed.auto_send = AUTO_SEND_ENABLED && parsed.label === '\\u{1F7E2}' && !!parsed.draft_body && !parsed.note_block && AUTO_SEND_CATEGORIES.has(parsed.category);\n\n  // --- CUSTOMER-FACING FOOTER: optional neutral review line, then the AI disclosure ---\n  if (parsed.draft_body) {\n    if (REVIEW_INVITE_ENABLED && parsed.label !== '\\u{1F534}' && parsed.label !== 'Partnerships' && REVIEW_INVITE_TEXT) {\n      parsed.draft_body = parsed.draft_body + '\\n\\n' + REVIEW_INVITE_TEXT;\n    }\n    if (AI_DISCLOSURE_ENABLED) {\n      const line = pickByLanguage(parsed.auto_send ? AI_DISCLOSURE_AUTO : AI_DISCLOSURE_DRAFT, parsed.language);\n      if (line) parsed.draft_body = parsed.draft_body + '\\n\\n' + line;\n    }\n  }\n\n  let assembled;\n  if (parsed.draft_body) {\n    assembled = parsed.note_block\n      ? parsed.draft_body + '\\n\\n---\\n[🤖 AGENT NOTE: delete before sending]\\n\\n' + parsed.note_block\n      : parsed.draft_body;\n  } else if (parsed.note_block) {\n    assembled = '[🤖 AGENT NOTE]\\n\\n' + parsed.note_block;\n  } else {\n    assembled = '⚠️ The agent could not generate a reply. To be handled manually.';\n  }\n  return {\n    json: {\n      ...mail,\n      ...parsed,\n      assembled_body: assembled,\n      is_partnership: parsed.label === 'Partnerships'\n    },\n    pairedItem: { item: i }\n  };\n});\n"
+      },
+      "id": "3c961580-a166-4928-8838-a5609ef1d60b",
+      "name": "Parse agent output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4176,
+        -64
+      ],
+      "notes": "Parses the model JSON and applies the code guardrails: forced red for escalations (chat tool, low-rating review, legal, safety or health, personal data, very unhappy), green downgraded below the confidence threshold or when a commitment or unlisted code appears, then adds the AI disclosure line. The auto-send toggle is here (off by default)."
+    },
+    {
+      "parameters": {
+        "resource": "draft",
+        "subject": "={{ $('Filter non-partnership').item.json.draft_subject }}",
+        "message": "={{ $('Filter non-partnership').item.json.assembled_body }}",
+        "options": {
+          "threadId": "={{ $('Filter non-partnership').item.json.thread_id }}",
+          "sendTo": "={{ $('Filter non-partnership').item.json.from_email }}"
+        }
+      },
+      "id": "fac12189-b5d3-47be-be65-7f09c9b5e503",
+      "name": "Create Gmail draft",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5296,
+        -64
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "webhookId": "2cf404f8-f648-4b48-9272-e396fd58023f",
+      "notes": "Creates a draft in the customer's thread. Nothing is sent. The reviewer note sits below a separator and must be deleted before sending."
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "addLabels",
+        "threadId": "={{ $('Filter non-partnership').item.json.thread_id }}",
+        "labelIds": "={{ [$('Filter non-partnership').item.json.label_id_map[$('Filter non-partnership').item.json.label]] }}"
+      },
+      "id": "d1569375-95fd-4cfd-8426-d5d14ac438a6",
+      "name": "Apply Gmail label",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5520,
+        -64
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "notes": "Labels the whole thread, so the thread and its draft show up under the matching support label.",
+      "webhookId": "0c4224e6-3e36-4b96-b004-48480bfc8a76"
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "addLabels",
+        "threadId": "={{ $('Filter partnership').item.json.thread_id }}",
+        "labelIds": "={{ [$('Filter partnership').item.json.label_id_map[$('Filter partnership').item.json.label]] }}"
+      },
+      "id": "3b994518-b5db-4fee-b1c3-7919a490325e",
+      "name": "Apply Gmail label (partnership)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5072,
+        -256
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "notes": "Labels the whole thread with the partnerships label. No draft is created on this branch.",
+      "webhookId": "ccd8f545-e2d2-466b-90ea-3f17061bde14"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_MASTER_LOG_DOCUMENT_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "YOUR_MASTER_LOG_SHEET",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $now.toISO() }}",
+            "message_id": "={{ $('Inject label_id_map').item.json.message_id }}",
+            "thread_id": "={{ $('Inject label_id_map').item.json.thread_id }}",
+            "from_email": "={{ $('Inject label_id_map').item.json.from_email }}",
+            "from_name": "={{ $('Inject label_id_map').item.json.from_name }}",
+            "subject": "={{ $('Inject label_id_map').item.json.subject }}",
+            "language": "={{ $('Inject label_id_map').item.json.language }}",
+            "category": "={{ $('Inject label_id_map').item.json.category }}",
+            "emotional_level": "={{ $('Inject label_id_map').item.json.emotional_level }}",
+            "confidence": "={{ $('Inject label_id_map').item.json.confidence }}",
+            "label_applied": "={{ $('Inject label_id_map').item.json.label }}",
+            "shopify_order": "={{ $('Inject label_id_map').item.json.shopify_order_number }}",
+            "summary": "={{ $('Inject label_id_map').item.json.summary }}",
+            "processed_at": "={{ $now.toISO() }}",
+            "thread_history_count": "={{ $('Merge Memory').item.json.thread_history_count }}",
+            "has_memory": "={{ $('Merge Memory').item.json.has_memory }}",
+            "draft_subject": "={{ $('Inject label_id_map').item.json.draft_subject }}",
+            "draft_body": "={{ $('Inject label_id_map').item.json.draft_body }}",
+            "note_block": "={{ $('Inject label_id_map').item.json.note_block }}"
+          },
+          "schema": [
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "thread_id",
+              "displayName": "thread_id",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "from_email",
+              "displayName": "from_email",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "from_name",
+              "displayName": "from_name",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "subject",
+              "displayName": "subject",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "language",
+              "displayName": "language",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "category",
+              "displayName": "category",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "emotional_level",
+              "displayName": "emotional_level",
+              "type": "number",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "type": "number",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "label_applied",
+              "displayName": "label_applied",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "shopify_order",
+              "displayName": "shopify_order",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "processed_at",
+              "displayName": "processed_at",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "thread_history_count",
+              "displayName": "thread_history_count",
+              "type": "number",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "has_memory",
+              "displayName": "has_memory",
+              "type": "boolean",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "draft_subject",
+              "displayName": "draft_subject",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "draft_body",
+              "displayName": "draft_body",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "note_block",
+              "displayName": "note_block",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            }
+          ],
+          "matchingColumns": []
+        },
+        "options": {}
+      },
+      "id": "89d4e8ff-51ea-467a-b5fe-5b0f007c265c",
+      "name": "Log Master Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        5968,
+        32
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "googleSheetsOAuth2Api"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_MASTER_LOG_DOCUMENT_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "YOUR_MASTER_LOG_SHEET",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $now.toISO() }}",
+            "message_id": "={{ $('Inject label_id_map').item.json.message_id }}",
+            "thread_id": "={{ $('Inject label_id_map').item.json.thread_id }}",
+            "from_email": "={{ $('Inject label_id_map').item.json.from_email }}",
+            "from_name": "={{ $('Inject label_id_map').item.json.from_name }}",
+            "subject": "={{ $('Inject label_id_map').item.json.subject }}",
+            "language": "={{ $('Inject label_id_map').item.json.language }}",
+            "category": "={{ $('Inject label_id_map').item.json.category }}",
+            "emotional_level": "={{ $('Inject label_id_map').item.json.emotional_level }}",
+            "confidence": "={{ $('Inject label_id_map').item.json.confidence }}",
+            "label_applied": "Partnerships",
+            "shopify_order": "",
+            "summary": "={{ $('Inject label_id_map').item.json.summary }}",
+            "processed_at": "={{ $now.toISO() }}",
+            "thread_history_count": "={{ $('Merge Memory').item.json.thread_history_count }}",
+            "has_memory": "={{ $('Merge Memory').item.json.has_memory }}",
+            "draft_subject": "",
+            "draft_body": "",
+            "note_block": ""
+          },
+          "schema": [
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "thread_id",
+              "displayName": "thread_id",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "from_email",
+              "displayName": "from_email",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "from_name",
+              "displayName": "from_name",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "subject",
+              "displayName": "subject",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "language",
+              "displayName": "language",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "category",
+              "displayName": "category",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "emotional_level",
+              "displayName": "emotional_level",
+              "type": "number",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "type": "number",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "label_applied",
+              "displayName": "label_applied",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "shopify_order",
+              "displayName": "shopify_order",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "processed_at",
+              "displayName": "processed_at",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "thread_history_count",
+              "displayName": "thread_history_count",
+              "type": "number",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "has_memory",
+              "displayName": "has_memory",
+              "type": "boolean",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "draft_subject",
+              "displayName": "draft_subject",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "draft_body",
+              "displayName": "draft_body",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "note_block",
+              "displayName": "note_block",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            }
+          ],
+          "matchingColumns": []
+        },
+        "options": {}
+      },
+      "id": "4aa03497-1120-4abd-bd26-e8c5975840b0",
+      "name": "Log Master Sheet (partnership)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        5520,
+        -256
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "googleSheetsOAuth2Api"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "nomic-embed-text:latest"
+      },
+      "id": "e287fa70-297e-4309-ad51-62a4e0fc89e7",
+      "name": "Embeddings KB1 (Ollama)",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOllama",
+      "typeVersion": 1,
+      "position": [
+        3344,
+        368
+      ],
+      "credentials": {
+        "ollamaApi": {
+          "id": "REPLACE_ME",
+          "name": "ollamaApi"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "retrieve-as-tool",
+        "toolDescription": "Facts knowledge base: products and prices, warranty and return terms, delivery conditions, how-to answers, privacy contact. Use it for any factual question about the products or the store policies.",
+        "tableName": "kb_facts_embeddings",
+        "options": {}
+      },
+      "id": "c567fa5c-bf91-497b-a202-be2d4c62ffef",
+      "name": "kb1_facts",
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePGVector",
+      "typeVersion": 1.3,
+      "position": [
+        3264,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "postgres"
+        }
+      },
+      "notes": "Vector store as a tool (table kb_facts_embeddings). Fill it with your own facts, see examples/kb1-facts.example.md."
+    },
+    {
+      "parameters": {
+        "model": "nomic-embed-text:latest"
+      },
+      "id": "3412ed57-9073-476c-897c-ffb4e93db400",
+      "name": "Embeddings KB2 (Ollama)",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOllama",
+      "typeVersion": 1,
+      "position": [
+        3632,
+        368
+      ],
+      "credentials": {
+        "ollamaApi": {
+          "id": "REPLACE_ME",
+          "name": "ollamaApi"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "retrieve-as-tool",
+        "toolDescription": "Support playbook (internal, for email use only): tone rules, goodwill scale, reviewer note format, label rules, escalation handling, approved reply templates. Use it BEFORE writing a draft and to choose the label.",
+        "tableName": "kb_playbook_embeddings",
+        "options": {}
+      },
+      "id": "bd326438-efd9-4f26-b25f-5ce55907f5fe",
+      "name": "kb2_playbook",
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePGVector",
+      "typeVersion": 1.3,
+      "position": [
+        3552,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "postgres"
+        }
+      },
+      "notes": "Vector store as a tool (table kb_playbook_embeddings). Fill it with your own playbook, see examples/kb2-playbook.example.md."
+    },
+    {
+      "parameters": {
+        "toolDescription": "Read-only lookup of the orders placed with the email address of the current email sender. The address is fixed by the system and cannot be changed. Optional input: order_number (for example #1001) when the customer wrote one. Returns JSON: found (boolean), count, orders[] (at most 5, most recent first), each with name, created_at_local, days_since_order, financial_status, fulfillment_status, items[], tracking_numbers[], tracking_urls[]. No address and no customer name is returned. found=false means no order exists for this sender address.",
+        "method": "POST",
+        "url": "https://YOUR_N8N_HOST/webhook/orders-by-sender",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "parametersBody": {
+          "values": [
+            {
+              "name": "email",
+              "valueProvider": "fieldValue",
+              "value": "={{ $('Merge Memory').item.json.from_email }}"
+            },
+            {
+              "name": "order_number",
+              "valueProvider": "modelOptional"
+            }
+          ]
+        },
+        "placeholderDefinitions": {
+          "values": [
+            {
+              "name": "order_number",
+              "description": "Optional order number, only if the customer explicitly wrote one, for example #1001",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "c1f0f2c2-8048-4b15-bfb0-8ced665b8f07",
+      "name": "shopify_orders",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [
+        3840,
+        160
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "Order lookup webhook auth"
+        }
+      },
+      "notes": "The email searched is set by an expression on the sender address of the current email; the model can only add an optional order number. The webhook behind this URL must check the Header Auth credential (see README, Order lookup contract)."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_UNANSWERED_LOG_DOCUMENT_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "YOUR_UNANSWERED_LOG_SHEET",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $now.toISO() }}",
+            "from_email": "={{ $('Inject label_id_map').item.json.from_email }}",
+            "subject": "={{ $('Inject label_id_map').item.json.subject }}",
+            "question_extract": "={{ ($('Inject label_id_map').item.json.body || '').slice(0, 200) }}",
+            "reason": "={{ $('Inject label_id_map').item.json.confidence < $('Inject label_id_map').item.json.confidence_threshold ? 'confidence below ' + $('Inject label_id_map').item.json.confidence_threshold : ($('Inject label_id_map').item.json.language !== $('Inject label_id_map').item.json.default_language ? 'language: ' + $('Inject label_id_map').item.json.language : 'ambiguous case or not covered by the knowledge base') }}",
+            "category_detected": "={{ $('Inject label_id_map').item.json.category }}",
+            "proposed_draft": "={{ $('Inject label_id_map').item.json.draft_body }}",
+            "gmail_url": "=https://mail.google.com/mail/u/0/#inbox/{{ $('Inject label_id_map').item.json.thread_id }}",
+            "status": "To process",
+            "kb_update_needed": ""
+          },
+          "schema": [
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "from_email",
+              "displayName": "from_email",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "subject",
+              "displayName": "subject",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "question_extract",
+              "displayName": "question_extract",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "reason",
+              "displayName": "reason",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "category_detected",
+              "displayName": "category_detected",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "proposed_draft",
+              "displayName": "proposed_draft",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "gmail_url",
+              "displayName": "gmail_url",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "kb_update_needed",
+              "displayName": "kb_update_needed",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            }
+          ],
+          "matchingColumns": []
+        },
+        "options": {}
+      },
+      "id": "835a2f59-aedc-4fe5-b704-1e247650371e",
+      "name": "Log Unanswered Questions",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        6416,
+        -64
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "googleSheetsOAuth2Api"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Queue for a person who updates the knowledge base. One row per email that ended on the blue label. The confidence threshold and default language come from Extract email data."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "m1",
+              "name": "label_id_map",
+              "value": "={{ ({ \"🔴\": \"YOUR_LABEL_ID_URGENT\", \"🟡\": \"YOUR_LABEL_ID_ACTION\", \"🔵\": \"YOUR_LABEL_ID_TO_VALIDATE\", \"🟢\": \"YOUR_LABEL_ID_HANDLED\", \"Partnerships\": \"YOUR_LABEL_ID_PARTNERSHIPS\" }) }}",
+              "type": "object"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "66fb5f7b-57e2-499f-b274-c728917bb9c9",
+      "name": "Inject label_id_map",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4400,
+        -64
+      ],
+      "notes": "Gmail label ids of the five support labels: urgent, action, to validate, handled, partnerships. Replace the placeholders with your own ids."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 3
+            }
+          ]
+        }
+      },
+      "id": "cbcc9f11-8b40-410e-8677-4ef66710af48",
+      "name": "Schedule Trigger (every 3 min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -448,
+        128
+      ],
+      "notes": "Runs every 3 minutes. Change the interval here if you want a slower inbox poll."
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "limit": 10,
+        "simple": false,
+        "filters": {
+          "q": "-label:\"Support/🔴 Urgent action\" -label:\"Support/🟡 Action needed\" -label:\"Support/🔵 To validate\" -label:\"Support/🟢 Handled by agent\" -label:\"Partnerships\" -label:\"Admin\" -label:\"Auto-archived\" -label:\"Chat tool\" -label:\"Social video\" -label:\"Messaging\" -label:\"Social ads\" -label:\"Email marketing\" -label:\"Reviews\" -label:\"Support/🤖 Auto-sent\"",
+          "readStatus": "unread"
+        },
+        "options": {}
+      },
+      "id": "1ab1289a-5e57-4e38-a8a0-e4fd76a822e9",
+      "name": "Gmail Get Unread",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -224,
+        32
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "notes": "Fetches up to 10 unread emails per run. The query excludes threads that already carry a support or non-support label (second dedup layer). All senders are passed to the workflow.",
+      "webhookId": "f4b4026a-bff7-4622-91bc-edab4ac0ecab"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "support-agent-run",
+        "options": {},
+        "authentication": "headerAuth"
+      },
+      "id": "78af15f4-f637-4f36-8105-65c46e8a87e6",
+      "name": "Manual run webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        -64
+      ],
+      "webhookId": "3b1f6c1e-7a52-4a43-9c0e-5d2a6f0e1a11",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "Support webhook auth"
+        }
+      },
+      "notes": "Starts a run on demand: POST with the header required by the Header Auth credential. Without the right header n8n answers 403."
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.is_partnership === true);"
+      },
+      "id": "ce641a66-b1d0-409f-a033-0148c674a7a8",
+      "name": "Filter partnership",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4624,
+        -256
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.is_partnership !== true);"
+      },
+      "id": "2c8e13e3-1eb4-4a47-99af-75f9dbe707a0",
+      "name": "Filter non-partnership",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4624,
+        32
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.label === '🔵');"
+      },
+      "id": "718ac128-0fdf-40ff-9dac-cd2f31daa7bf",
+      "name": "Filter 🔵 unanswered",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6192,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "removeLabels",
+        "threadId": "={{ $('Filter non-partnership').item.json.thread_id }}",
+        "labelIds": [
+          "UNREAD",
+          "INBOX"
+        ]
+      },
+      "id": "d1405df8-9dfe-4ca0-a638-b665d26f0aff",
+      "name": "Mark Read + Archive (support)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5744,
+        32
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "webhookId": "03ccd7e5-400d-4b6d-8b3e-4ba2b520cc9c"
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "removeLabels",
+        "threadId": "={{ $('Filter partnership').item.json.thread_id }}",
+        "labelIds": [
+          "UNREAD",
+          "INBOX"
+        ]
+      },
+      "id": "81e6b9d0-b7a9-4e07-9645-bf04a04718ac",
+      "name": "Mark Read + Archive (partnership)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5296,
+        -256
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "webhookId": "5ac0875a-a24c-40ce-aa7e-638e17f92814"
+    },
+    {
+      "parameters": {},
+      "id": "7d0b1c52-6a3e-4f1b-9c0e-2b7a5e1d4c31",
+      "name": "Merge support + escalation",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        2016,
+        -64
+      ],
+      "notes": "Joins the support branch and the escalated non-support branch (chat tool alerts, low-rating reviews) so that Get Thread History and Format Thread History run once per email."
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "get",
+        "threadId": "={{ $json.thread_id }}",
+        "options": {
+          "returnOnlyMessages": true
+        }
+      },
+      "id": "3b9ba399-907f-4cc1-8d75-730e6f0308f8",
+      "name": "Get Thread History",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2240,
+        -64
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "webhookId": "240f036a-0d04-4258-8f3e-3a0dd96b2022"
+    },
+    {
+      "parameters": {
+        "jsCode": "const allMessages = $input.all().map(item => item.json || {});\nconst byThread = {};\nfor (const message of allMessages) {\n  const threadId = message.threadId;\n  if (!threadId) continue;\n  if (!byThread[threadId]) byThread[threadId] = [];\n  byThread[threadId].push(message);\n}\n\n// One run per email: the Merge node joins the support branch and the escalation branch.\nconst inputs = $('Merge support + escalation').all();\n\nreturn inputs.map((item, index) => {\n  const current = item.json || {};\n  const threadMessages = byThread[current.thread_id] || [];\n  const history = threadMessages\n    .filter(message => message.id !== current.message_id)\n    .sort((a, b) => Number(a.internalDate || 0) - Number(b.internalDate || 0))\n    .slice(-5);\n\n  const threadHistory = history.length > 0\n    ? history.map(message => {\n        const headers = message.payload?.headers || [];\n        const fromHeader = headers.find(header => header.name === 'From');\n        const fromValue = fromHeader ? fromHeader.value : (message.From || 'Unknown');\n        const dateValue = message.internalDate\n          ? new Date(Number(message.internalDate)).toISOString().split('T')[0]\n          : '?';\n        const snippet = String(message.snippet || '').slice(0, 500);\n        const normalizedFrom = String(fromValue).toLowerCase();\n        const ownDomains = Array.isArray(current.own_domains) ? current.own_domains : [];\n        const isFromStore = ownDomains.some(d => normalizedFrom.includes(String(d).toLowerCase()));\n        const speaker = isFromStore ? 'STORE (support team)' : 'CUSTOMER';\n        return `[${dateValue}] ${speaker}: ${snippet}`;\n      }).join('\\n\\n')\n    : '';\n\n  return {\n    json: {\n      ...current,\n      thread_history: threadHistory,\n      thread_history_count: history.length,\n    },\n    pairedItem: { item: index },\n  };\n});\n"
+      },
+      "id": "ff5c0b25-1fe5-42e4-953c-33e1b0dd1223",
+      "name": "Format Thread History",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        -64
+      ],
+      "notes": "Keeps the last 5 messages of the Gmail thread as short snippets (500 characters each). Messages from the store's own domains are labeled as the support team."
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "support-memory-init",
+        "options": {},
+        "authentication": "headerAuth"
+      },
+      "id": "da387d0c-0231-4385-aca0-765c9556d898",
+      "name": "Init Support Memory webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        -496
+      ],
+      "webhookId": "9d4e2b7a-1c63-4f88-8a35-2e7b0c4d5f22",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "Support webhook auth"
+        }
+      },
+      "notes": "Call once (POST, with the auth header) to create the support_memory table."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "CREATE TABLE IF NOT EXISTS support_memory (\n  customer_email TEXT PRIMARY KEY,\n  first_contact_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n  last_interaction_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n  total_interactions INT NOT NULL DEFAULT 0,\n  summary TEXT,\n  open_issues TEXT,\n  sentiment_history TEXT,\n  last_order_number TEXT,\n  flags TEXT,\n  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);\nCREATE INDEX IF NOT EXISTS idx_support_memory_last_interaction ON support_memory(last_interaction_date DESC);",
+        "options": {}
+      },
+      "id": "ddb7bcd6-d19d-4dfb-9417-9878ab514dd4",
+      "name": "Create support_memory table",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -224,
+        -496
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH purge AS (\n  DELETE FROM support_memory WHERE last_interaction_date < NOW() - make_interval(days => $2::int)\n)\nSELECT customer_email, first_contact_date, last_interaction_date, total_interactions, summary, open_issues, sentiment_history, last_order_number, flags, updated_at FROM support_memory WHERE customer_email = $1 AND last_interaction_date >= NOW() - make_interval(days => $2::int)\nUNION ALL\nSELECT NULL::text, NULL::timestamptz, NULL::timestamptz, 0, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::timestamptz WHERE NOT EXISTS (SELECT 1 FROM support_memory WHERE customer_email = $1 AND last_interaction_date >= NOW() - make_interval(days => $2::int))\nLIMIT 1;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{ [ $json.from_email, $json.memory_retention_days ] }}"
+        }
+      },
+      "id": "729b78eb-53c9-46d1-8d91-3f770484bb6e",
+      "name": "Read Support Memory",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2688,
+        -64
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "postgres"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Reads the customer memory and, in the same statement, deletes every memory row whose last interaction is older than the retention period (MEMORY_RETENTION_DAYS in Extract email data, 365 days by default). Expired rows are never returned."
+    },
+    {
+      "parameters": {
+        "jsCode": "const mailItems = $('Format Thread History').all();\nconst memoryItems = $input.all();\n\nreturn mailItems.map((mailItem, idx) => {\n  const mailData = mailItem.json;\n  const memResult = memoryItems[idx]?.json;\n  const hasReadableMemory = memResult && !memResult.error && memResult.customer_email;\n  const memory = hasReadableMemory ? memResult : null;\n\n  let memoryText = '';\n  if (memory) {\n    memoryText = 'CUSTOMER MEMORY (previous support history):\\n- First contact: ' + memory.first_contact_date + '\\n- Last interaction: ' + memory.last_interaction_date + '\\n- Total interactions: ' + memory.total_interactions + '\\n- Summary: ' + (memory.summary || 'none') + '\\n- Open issues: ' + (memory.open_issues || 'none') + '\\n- Sentiment history: ' + (memory.sentiment_history || 'neutral') + '\\n- Last order: ' + (memory.last_order_number || 'none') + '\\n- Flags: ' + (memory.flags || 'none');\n  }\n\n  return {\n    json: Object.assign({}, mailData, {\n      client_memory: memoryText,\n      has_memory: memory !== null,\n      support_memory_unavailable: !!(memResult && memResult.error)\n    }),\n    pairedItem: { item: idx }\n  };\n});\n"
+      },
+      "id": "8e26907d-c53a-4358-84f1-b74b0eda2638",
+      "name": "Merge Memory",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2912,
+        -64
+      ],
+      "notes": "Rebuilds the memory text for the prompt. If the memory query failed, the email still goes through without memory."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO support_memory (customer_email, first_contact_date, last_interaction_date, total_interactions, summary, sentiment_history, last_order_number, updated_at) VALUES ($1, NOW(), NOW(), 1, NULLIF($2, 'Agent parsing failed'), 'lvl' || $3::text, NULLIF($4, '__NONE__'), NOW()) ON CONFLICT (customer_email) DO UPDATE SET last_interaction_date = NOW(), total_interactions = support_memory.total_interactions + 1, summary = COALESCE(NULLIF($2, 'Agent parsing failed'), support_memory.summary), sentiment_history = COALESCE(support_memory.sentiment_history, '') || '→lvl' || $3::text, last_order_number = COALESCE(NULLIF($4, '__NONE__'), support_memory.last_order_number), updated_at = NOW();",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{ [ $('Inject label_id_map').item.json.from_email, String($('Inject label_id_map').item.json.summary || '').slice(0, 300), $('Inject label_id_map').item.json.emotional_level ?? 0, $('Inject label_id_map').item.json.shopify_order_number || '__NONE__' ] }}"
+        }
+      },
+      "id": "326312c9-6bc3-4975-a9a9-6c4a3d8e2409",
+      "name": "Update Support Memory",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        6192,
+        128
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "postgres"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Upserts the memory row: interaction count, one-line summary (capped at 300 characters), sentiment trail, last order number. Parameters are passed as an array so a comma inside the summary cannot shift them."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== CONFIGURATION (edit this block for your own senders) =====\n// Domain lists are matched on the sender domain (lower case): exact, subdomain, or substring.\n// Values ending in .example are placeholders and match nothing real: replace them with the domains you see in your inbox.\n// The store's own domains (OWN_DOMAINS) are set once in Extract email data.\nconst CHAT_TOOL_DOMAINS = ['chat-tool.example'];                  // sender domain of your live chat tool alerts\nconst CHAT_TOOL_ESCALATION_ENABLED = true;\n// Phrases (lower case) meaning \"a conversation needs a human\". Matched in the subject or the body.\nconst CHAT_TOOL_ESCALATION_PHRASES = ['needs a human', 'human requested', 'handoff requested', 'please take over', 'agent needed'];\nconst REGISTRAR_DOMAINS = ['registrar.example', 'hosting.example'];            // domain and hosting providers\nconst FILE_TRANSFER_DOMAINS = ['file-transfer.example'];\nconst SOCIAL_VIDEO_DOMAINS = ['video-platform.example'];\nconst MESSAGING_DOMAINS = ['messaging-app.example'];                           // e.g. a messaging platform you run a business account on\nconst SOCIAL_ADS_DOMAINS = ['ads-manager.example', 'social-network.example'];\nconst SOCIAL_ADS_SENDER_NAMES = ['ads manager', 'social network'];             // exact or prefix match on the sender name (lower case)\nconst EMAIL_MARKETING_DOMAINS = ['email-marketing.example'];\nconst EMAIL_MARKETING_SENDER_NAMES = ['email marketing'];\nconst REVIEW_PLATFORM_DOMAINS = ['reviews.example'];\nconst REVIEW_PLATFORM_SENDER_NAMES = ['reviews team'];\nconst MARKETING_SYSTEM_DOMAINS = ['mailer.marketing.example'];                 // exact or subdomain match\nconst STORE_PLATFORM_DOMAINS = ['shopify.com'];                                // your shop platform: its contact form notifications are real customer email\nconst STORE_PLATFORM_FORM_PHRASES = ['new customer message', 'contact form', 'you received a new message from your online store'];\nconst NEGATIVE_REVIEW_PATTERN = /\\b[123]\\s*(star|stars)\\b|\\b[123]\\s*\\/\\s*5\\b/i;\nconst OOO_SUBJECT_PATTERNS = ['automatic reply', 'auto-reply', 'autoreply', 'automatic response', 'out of office', 'out-of-office', 'away from the office', 'vacation reply'];\nconst OOO_BODY_PATTERNS = ['i am currently out of the office', 'i will be out of the office', 'i am away until', 'i will reply when i return', 'i am on leave until', 'limited access to email', 'i will respond on my return'];\nconst ADMIN_KEYWORDS = ['partnership', 'collaboration', 'business proposal', 'b2b', 'commercial offer', 'meeting request', 'demo', 'investment', 'funding', 'acquisition', 'due diligence', 'cold outreach', 'account executive', 'business development', 'lead generation', 'guest post'];\nconst TECHNICAL_ADMIN_KEYWORDS = ['domain', 'expire', 'expiration', 'renewal', 'dns', 'ssl', 'hosting', 'registrar'];\n// Words that signal a real customer. They stop the weaker \"admin\" rules below (not the sender-domain rules).\nconst SUPPORT_SIGNAL_KEYWORDS = ['order', 'parcel', 'package', 'delivery', 'tracking', 'refund', 'return', 'exchange', 'replace', 'payment', 'cancel', 'warranty', 'product', 'defective', 'faulty', 'broken', 'not working', 'damaged', 'invoice', 'account'];\nconst SYSTEM_ADDRESS_PATTERNS = ['no-reply', 'noreply', 'notification', 'mailer', 'donotreply', 'do-not-reply', 'newsletter', 'updates@', 'news@', 'alerts@', 'alert@', 'bounce', 'postmaster@', 'auto-', 'reply-', 'hello@', 'team@', 'info@', 'contact@', 'support@', 'service@', 'admin@', 'help@', 'feedback@'];\n// Consumer mailbox providers. A sender NOT on one of these is treated as \"business-like\" by the weaker admin rules.\n// CONSUMER_DOMAIN_STEMS matches the first label of the domain, so gmail.com, gmail.co.uk, hotmail.de, yahoo.com.au... all match.\nconst CONSUMER_DOMAIN_STEMS = ['gmail', 'googlemail', 'outlook', 'hotmail', 'live', 'msn', 'yahoo', 'ymail', 'icloud', 'aol', 'proton', 'protonmail', 'gmx', 'zoho'];\nconst CONSUMER_DOMAINS_EXACT = ['me.com', 'mac.com', 'mail.com', 'pm.me', 'fastmail.com'];\nconst BUSINESS_SENDER_RULES_ENABLED = true;   // false: every sender is treated as a possible customer by the weak admin rules (safer, more email reaches the agent)\n// ===== END CONFIGURATION =====\n\nreturn $input.all().map(({ json: mail }) => {\n  const OWN_DOMAINS = Array.isArray(mail.own_domains) ? mail.own_domains : [];\n  const from = (mail.from_email || '').toLowerCase();\n  const fromName = (mail.from_name || '').toLowerCase();\n  const subject = (mail.subject || '').toLowerCase();\n  const body = (mail.body || '').toLowerCase();\n  const fromDomain = from.split('@')[1] || '';\n  const fromLocal = from.split('@')[0] || '';\n  const domainIn = (list) => list.some(d => fromDomain === d || fromDomain.endsWith('.' + d) || fromDomain.includes(d));\n  const domainIs = (list) => list.some(d => fromDomain === d || fromDomain.endsWith('.' + d));\n  const nameIn = (list) => list.some(n => fromName === n || fromName.startsWith(n));\n\n  let category = null;\n  let requires_support_escalation = false;\n  let escalation_reason = null;\n\n  // ===== AUTO-ARCHIVE: out-of-office replies =====\n  // Top priority: no AI agent, no draft.\n  const isOOO = OOO_SUBJECT_PATTERNS.some(p => subject.includes(p)) || OOO_BODY_PATTERNS.some(p => body.slice(0, 2000).includes(p));\n  if (isOOO) {\n    return {\n      json: Object.assign({}, mail, {\n        non_support_category: 'auto_archive',\n        is_non_support: true,\n        requires_support_escalation: false,\n        escalation_reason: null\n      })\n    };\n  }\n\n  const isStoreFormMail = domainIs(STORE_PLATFORM_DOMAINS) && STORE_PLATFORM_FORM_PHRASES.some(p => subject.includes(p) || body.includes(p));\n\n  const isConsumerSender = CONSUMER_DOMAIN_STEMS.includes(fromDomain.split('.')[0]) || CONSUMER_DOMAINS_EXACT.some(d => fromDomain === d);\n  const isLikelyB2BSender = BUSINESS_SENDER_RULES_ENABLED && !!fromDomain && !isConsumerSender;\n\n  const isTechnicalAdminDomain = domainIn(REGISTRAR_DOMAINS);\n  const hasTechnicalAdminKeyword = TECHNICAL_ADMIN_KEYWORDS.some(k => subject.includes(k) || body.slice(0, 1000).includes(k));\n  // CUSTOMER GUARD: strong signals of a real customer. When present, the weaker rules (technical keywords,\n  // admin keywords, system-looking address) do NOT file the email as admin. Rules based on the sender DOMAIN\n  // (marketing tool, social platform, chat tool, reviews, file transfer, registrar) are not affected.\n  const hasSupportSignal = SUPPORT_SIGNAL_KEYWORDS.some(k => subject.includes(k) || body.slice(0, 2000).includes(k)) || /#\\s?\\d{3,6}/.test(subject) || /#\\s?\\d{3,6}/.test(body.slice(0, 2000));\n  const hasAdminKeyword = ADMIN_KEYWORDS.some(k => subject.includes(k) || body.slice(0, 500).includes(k));\n\n  // ===== PRIORITY SYSTEM SENDERS =====\n  // These rules come before hasSupportSignal: a system email often mentions \"order\" or \"payment\",\n  // but a customer never writes from a no-reply address or from the store's own domain.\n  const isOwnSender = OWN_DOMAINS.some(d => fromDomain === d || fromDomain.endsWith('.' + d));\n  const isNoReplyLocal = /(^|[._-])(no[-_.]?reply|donotreply|do[-_.]not[-_.]reply|mailer-daemon|postmaster|bounces?)([._-]|$)/.test(fromLocal);\n  const isMarketingSystemDomain = domainIs(MARKETING_SYSTEM_DOMAINS);\n\n  if (isStoreFormMail) {\n    category = null;\n  }\n  else if (isOwnSender) {\n    // The store's own email received on the support inbox (newsletters, notifications sent in the store's name).\n    category = 'auto_archive';\n  }\n  else if (isTechnicalAdminDomain) {\n    category = 'admin';\n  }\n  else if (hasTechnicalAdminKeyword && isLikelyB2BSender && !hasSupportSignal) {\n    category = 'admin';\n  }\n  else if (domainIn(FILE_TRANSFER_DOMAINS)) {\n    category = 'file_transfer';\n  }\n  else if (domainIn(CHAT_TOOL_DOMAINS)) {\n    // An alert saying a conversation needs a human is a real request: escalated. A routine recap does not match the phrases.\n    category = 'chat_tool';\n    if (CHAT_TOOL_ESCALATION_ENABLED && CHAT_TOOL_ESCALATION_PHRASES.some(p => subject.includes(p) || body.includes(p))) {\n      requires_support_escalation = true;\n      escalation_reason = 'Chat tool alert: a conversation needs a human';\n    }\n  }\n  else if (domainIn(SOCIAL_VIDEO_DOMAINS)) {\n    category = 'social_video';\n  }\n  else if (domainIn(MESSAGING_DOMAINS)) {\n    category = 'messaging';\n  }\n  else if (domainIn(SOCIAL_ADS_DOMAINS) || nameIn(SOCIAL_ADS_SENDER_NAMES)) {\n    category = 'social_ads';\n  }\n  else if (domainIn(EMAIL_MARKETING_DOMAINS) || nameIn(EMAIL_MARKETING_SENDER_NAMES)) {\n    category = 'email_marketing';\n  }\n  else if (domainIn(REVIEW_PLATFORM_DOMAINS) || nameIn(REVIEW_PLATFORM_SENDER_NAMES)) {\n    category = 'reviews';\n    const hasNegativeReview = NEGATIVE_REVIEW_PATTERN.test(subject) || NEGATIVE_REVIEW_PATTERN.test(body.slice(0, 2000));\n    if (hasNegativeReview) {\n      requires_support_escalation = true;\n      escalation_reason = 'Review notification with a low rating (1 to 3 stars): contact the customer privately';\n    }\n  }\n  else if ((isNoReplyLocal && isLikelyB2BSender) || isMarketingSystemDomain) {\n    // No-reply address of a service or marketing platform: never a customer.\n    category = 'admin';\n  }\n  else if (isLikelyB2BSender && hasAdminKeyword && !hasSupportSignal) {\n    category = 'admin';\n  }\n  else {\n    const isSystemAddress = SYSTEM_ADDRESS_PATTERNS.some(p => fromLocal.includes(p) || from.includes(p));\n    if (isSystemAddress && isLikelyB2BSender && !hasSupportSignal) {\n      category = 'admin';\n    }\n  }\n\n  return {\n    json: Object.assign({}, mail, {\n      non_support_category: category,\n      is_non_support: category !== null,\n      requires_support_escalation,\n      escalation_reason\n    })\n  };\n});\n"
+      },
+      "id": "a70881bb-8cc6-4af6-b8c9-cd032be0d57e",
+      "name": "Classify Non-Support Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        32
+      ],
+      "notes": "Rule-based triage, no AI. Lists are constants in the CONFIGURATION block (placeholders ending in .example). The store's own domains come from Extract email data."
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.is_non_support === false);"
+      },
+      "id": "c45c616f-8833-4c78-803c-42de967a7b30",
+      "name": "Filter is_support",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.is_non_support === true);"
+      },
+      "id": "4bcb69cf-d720-497d-a836-1a4836b5b1ca",
+      "name": "Filter is_non_support",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const labelMap = {\n  admin: 'YOUR_LABEL_ID_ADMIN',\n  file_transfer: 'YOUR_LABEL_ID_FILE_TRANSFER',\n  chat_tool: 'YOUR_LABEL_ID_CHAT_TOOL',\n  social_video: 'YOUR_LABEL_ID_SOCIAL_VIDEO',\n  messaging: 'YOUR_LABEL_ID_MESSAGING',\n  social_ads: 'YOUR_LABEL_ID_SOCIAL_ADS',\n  email_marketing: 'YOUR_LABEL_ID_EMAIL_MARKETING',\n  reviews: 'YOUR_LABEL_ID_REVIEWS',\n  auto_archive: 'YOUR_LABEL_ID_AUTO_ARCHIVE'\n};\nconst SUPPORT_URGENT_LABEL = 'YOUR_LABEL_ID_URGENT';\n\nreturn $input.all().map(({ json: mail }, idx) => {\n  const labelId = labelMap[mail.non_support_category];\n  const labels = labelId ? [labelId] : [];\n  if (mail.requires_support_escalation) {\n    labels.push(SUPPORT_URGENT_LABEL);\n  }\n  return {\n    json: Object.assign({}, mail, { labels_to_apply: labels }),\n    pairedItem: { item: idx }\n  };\n});\n"
+      },
+      "id": "52361fdc-bcf7-47ba-95d1-dc16a578de31",
+      "name": "Determine Non-Support Label",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "addLabels",
+        "threadId": "={{ $json.thread_id }}",
+        "labelIds": "={{ $json.labels_to_apply }}"
+      },
+      "id": "76625bda-ffc5-40bc-8cd4-96635d68faa7",
+      "name": "Apply Non-Support Labels",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1568,
+        128
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "webhookId": "ae1356cd-7fc4-4a6a-812c-ac97c7b39226"
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "removeLabels",
+        "threadId": "={{ $('Determine Non-Support Label').item.json.thread_id }}",
+        "labelIds": [
+          "UNREAD",
+          "INBOX"
+        ]
+      },
+      "id": "cf59b12b-17df-4315-aae6-c35a81b8abc6",
+      "name": "Mark Read + Archive (Non-support)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1792,
+        128
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "webhookId": "7f8d4cc9-603f-49d6-9099-a1360e379c5f"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_ROUTING_LOG_DOCUMENT_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "YOUR_ROUTING_LOG_SHEET",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $now.toISO() }}",
+            "message_id": "={{ $('Classify Non-Support Email').item.json.message_id }}",
+            "thread_id": "={{ $('Classify Non-Support Email').item.json.thread_id }}",
+            "from_email": "={{ $('Classify Non-Support Email').item.json.from_email }}",
+            "from_name": "={{ $('Classify Non-Support Email').item.json.from_name }}",
+            "subject": "={{ $('Classify Non-Support Email').item.json.subject }}",
+            "category": "={{ $('Classify Non-Support Email').item.json.non_support_category }}",
+            "escalated_to_support": "={{ $('Classify Non-Support Email').item.json.requires_support_escalation }}",
+            "escalation_reason": "={{ $('Classify Non-Support Email').item.json.escalation_reason }}"
+          },
+          "schema": [
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "thread_id",
+              "displayName": "thread_id",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "from_email",
+              "displayName": "from_email",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "from_name",
+              "displayName": "from_name",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "subject",
+              "displayName": "subject",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "category",
+              "displayName": "category",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "escalated_to_support",
+              "displayName": "escalated_to_support",
+              "type": "boolean",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            },
+            {
+              "id": "escalation_reason",
+              "displayName": "escalation_reason",
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "required": false,
+              "display": true
+            }
+          ],
+          "matchingColumns": []
+        },
+        "options": {}
+      },
+      "id": "1c492b52-84b0-49c5-a919-84afa05c3656",
+      "name": "Log Non-Support Routing",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2016,
+        224
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "googleSheetsOAuth2Api"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// STRICT filter: only lets legitimate escalations through to the support flow.\n// All other non-support emails stop here (non-support label already applied, log already written).\nconst classifyAll = $('Classify Non-Support Email').all();\nconst results = [];\nfor (const item of $input.all()) {\n  const idx = item.pairedItem?.item ?? 0;\n  const classifyData = classifyAll[idx]?.json;\n  if (!classifyData) continue;\n\n  // 1. Escalation flag is mandatory\n  if (!classifyData.requires_support_escalation) continue;\n\n  // 2. Category must be chat tool OR reviews\n  const category = (classifyData.non_support_category || '').toLowerCase();\n  if (!['chat_tool', 'reviews'].includes(category)) continue;\n\n  // 3. Escalation reason must not be empty (at least 5 chars)\n  if (!classifyData.escalation_reason || classifyData.escalation_reason.length < 5) continue;\n\n  results.push({ json: classifyData, pairedItem: { item: idx } });\n}\nreturn results;\n"
+      },
+      "id": "520eae1f-1338-440a-8d11-5d464cd6c00d",
+      "name": "Filter escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        32
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "removeLabels",
+        "threadId": "={{ $json.thread_id }}",
+        "labelIds": [
+          "YOUR_LABEL_ID_URGENT",
+          "YOUR_LABEL_ID_ACTION",
+          "YOUR_LABEL_ID_TO_VALIDATE",
+          "YOUR_LABEL_ID_HANDLED",
+          "YOUR_LABEL_ID_PARTNERSHIPS"
+        ]
+      },
+      "id": "1e1315fd-2074-4de5-a6f1-072e80419c32",
+      "name": "Reset support labels",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5072,
+        -64
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Removes all five support labels from the thread before the new one is applied, so exactly one remains.",
+      "webhookId": "7decc3d8-db6d-4217-9f0b-ddc7e9a982c5"
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "removeLabels",
+        "threadId": "={{ $json.thread_id }}",
+        "labelIds": [
+          "YOUR_LABEL_ID_URGENT",
+          "YOUR_LABEL_ID_ACTION",
+          "YOUR_LABEL_ID_TO_VALIDATE",
+          "YOUR_LABEL_ID_HANDLED",
+          "YOUR_LABEL_ID_PARTNERSHIPS"
+        ]
+      },
+      "id": "d5544a58-c2d9-4b4e-bad3-118239d08456",
+      "name": "Reset support labels (partnership)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        4848,
+        -256
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Same reset, partnership branch.",
+      "webhookId": "8d514d81-96f6-43f6-b4c1-7faf6267b215"
+    },
+    {
+      "parameters": {
+        "toolDescription": "Reads the latest carrier status of a parcel from the 17TRACK API. Use only with a tracking number taken from a shopify_orders result. Single required input: tracking_number.",
+        "method": "POST",
+        "url": "https://api.17track.net/track/v2.4/gettrackinfo",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "[{\"number\":\"{tracking_number}\"}]",
+        "placeholderDefinitions": {
+          "values": [
+            {
+              "name": "tracking_number",
+              "description": "Tracking number taken from tracking_numbers[] of the chosen order",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "35b560e7-075d-439f-bc3f-b160042c7842",
+      "name": "tracking17_tool",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [
+        3968,
+        160
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "17TRACK token (header 17token)"
+        }
+      },
+      "notes": "The API key lives in a Header Auth credential (header name 17token), not in the node. The API version is part of the URL: check the 17TRACK documentation and use a currently supported version."
+    },
+    {
+      "parameters": {
+        "jsCode": "const CLAIM_RETENTION_DAYS = 90;   // claims older than this are purged by the same statement (the table only needs to cover the Gmail unread window)\nconst items = $input.all();\nif (!items.length) return [{ json: { sql: \"SELECT NULL::text AS message_id WHERE false;\", params: [], n: 0 } }];\n// Parameterized query: $1 is the retention in days, then two parameters (message_id, thread_id) per email.\nconst days = Math.max(1, parseInt(CLAIM_RETENTION_DAYS, 10) || 90);\nconst params = [days];\nconst rows = [];\nfor (const it of items) {\n  params.push(String(it.json.message_id == null ? '' : it.json.message_id));\n  params.push(String(it.json.thread_id == null ? '' : it.json.thread_id));\n  const k = params.length;\n  rows.push('($' + (k - 1) + '::text, $' + k + '::text, \\'pending\\', now())');\n}\nconst sql = 'WITH purge AS (DELETE FROM support_processed WHERE processed_at < NOW() - make_interval(days => $1::int)) INSERT INTO support_processed (message_id, thread_id, label, processed_at) VALUES ' + rows.join(', ') + ' ON CONFLICT (message_id) DO NOTHING RETURNING message_id;';\nreturn [{ json: { sql, params, n: items.length } }];\n"
+      },
+      "id": "51fc25ef-f7aa-4acd-885c-10f8d246a586",
+      "name": "Build claim SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        32
+      ],
+      "notes": "Builds one INSERT for the whole batch and purges claims older than CLAIM_RETENTION_DAYS in the same statement."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {
+          "queryReplacement": "={{ $json.params }}"
+        }
+      },
+      "id": "405e8305-0d56-444c-acf9-77e5a77d6fc6",
+      "name": "Claim messages (dedup)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        448,
+        32
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "postgres"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Inserts every message_id; only the rows really inserted come back, so overlapping runs never process the same email twice."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Recovers the emails whose message_id was CLAIMED (newly inserted).\n// If the claim query failed (DB down, onError continue), we degrade to NO dedup (everything goes through) so nothing is lost.\nconst claimRows = $input.all();\nconst claimFailed = claimRows.some(r => r.json && r.json.error);\nconst all = $('Extract email data').all();\nif (claimFailed) return all;\nconst claimed = new Set(claimRows.map(i => i.json && i.json.message_id).filter(Boolean));\nreturn all.filter(it => claimed.has(it.json.message_id));\n"
+      },
+      "id": "219ba1d1-97db-4f46-bfdb-7470fec7eedc",
+      "name": "Recover claimed emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        32
+      ],
+      "notes": "Keeps the emails whose claim succeeded. If the claim query fails, everything goes through (fail open) so no customer email is lost."
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.auto_send === true);"
+      },
+      "id": "8addbd94-7cff-4d14-be4d-4769a97b0a13",
+      "name": "Filter auto-send",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5072,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.auto_send !== true);"
+      },
+      "id": "06b60ae4-2792-4194-b315-d1280c998c3d",
+      "name": "Filter manual",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4848,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "reply",
+        "messageId": "={{ $('Filter auto-send').item.json.message_id }}",
+        "emailType": "text",
+        "message": "={{ $('Filter auto-send').item.json.draft_body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "6fc1120f-1f90-4d35-9ae2-60b4a467a0dc",
+      "name": "Send auto reply",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5296,
+        128
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "webhookId": "249bcf9b-557d-4b19-aa76-86ac5e86814a",
+      "notes": "Only reached when AUTO_SEND_ENABLED is true in Parse agent output. Off by default. Not validated on its own: test with a sandbox mailbox first."
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "addLabels",
+        "threadId": "={{ $('Filter auto-send').item.json.thread_id }}",
+        "labelIds": [
+          "YOUR_LABEL_ID_AUTO_SENT"
+        ]
+      },
+      "id": "7c5ef85d-82f2-4865-bda9-5ff7c854ef0e",
+      "name": "Label 🤖 auto-sent",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5520,
+        128
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "gmailOAuth2"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "webhookId": "499f94f5-5b0b-428f-8d69-818037db6aee",
+      "notes": "Only reached when auto-send is enabled. Marks the thread as sent by the agent."
+    }
+  ],
+  "connections": {
+    "Support Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse agent output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Gmail draft": {
+      "main": [
+        [
+          {
+            "node": "Apply Gmail label",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings KB1 (Ollama)": {
+      "ai_embedding": [
+        [
+          {
+            "node": "kb1_facts",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "kb1_facts": {
+      "ai_tool": [
+        [
+          {
+            "node": "Support Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings KB2 (Ollama)": {
+      "ai_embedding": [
+        [
+          {
+            "node": "kb2_playbook",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "kb2_playbook": {
+      "ai_tool": [
+        [
+          {
+            "node": "Support Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "shopify_orders": {
+      "ai_tool": [
+        [
+          {
+            "node": "Support Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse agent output": {
+      "main": [
+        [
+          {
+            "node": "Inject label_id_map",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger (every 3 min)": {
+      "main": [
+        [
+          {
+            "node": "Gmail Get Unread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Get Unread": {
+      "main": [
+        [
+          {
+            "node": "Extract email data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual run webhook": {
+      "main": [
+        [
+          {
+            "node": "Gmail Get Unread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inject label_id_map": {
+      "main": [
+        [
+          {
+            "node": "Filter partnership",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Filter non-partnership",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Master Sheet": {
+      "main": [
+        [
+          {
+            "node": "Filter 🔵 unanswered",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Update Support Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter 🔵 unanswered": {
+      "main": [
+        [
+          {
+            "node": "Log Unanswered Questions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Gmail label": {
+      "main": [
+        [
+          {
+            "node": "Mark Read + Archive (support)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Read + Archive (support)": {
+      "main": [
+        [
+          {
+            "node": "Log Master Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Gmail label (partnership)": {
+      "main": [
+        [
+          {
+            "node": "Mark Read + Archive (partnership)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Read + Archive (partnership)": {
+      "main": [
+        [
+          {
+            "node": "Log Master Sheet (partnership)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Thread History": {
+      "main": [
+        [
+          {
+            "node": "Format Thread History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Support Memory webhook": {
+      "main": [
+        [
+          {
+            "node": "Create support_memory table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Thread History": {
+      "main": [
+        [
+          {
+            "node": "Read Support Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Support Memory": {
+      "main": [
+        [
+          {
+            "node": "Merge Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Memory": {
+      "main": [
+        [
+          {
+            "node": "Support Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Non-Support Email": {
+      "main": [
+        [
+          {
+            "node": "Filter is_support",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Filter is_non_support",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter is_support": {
+      "main": [
+        [
+          {
+            "node": "Merge support + escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter is_non_support": {
+      "main": [
+        [
+          {
+            "node": "Determine Non-Support Label",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Determine Non-Support Label": {
+      "main": [
+        [
+          {
+            "node": "Apply Non-Support Labels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Non-Support Labels": {
+      "main": [
+        [
+          {
+            "node": "Mark Read + Archive (Non-support)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Read + Archive (Non-support)": {
+      "main": [
+        [
+          {
+            "node": "Log Non-Support Routing",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Filter escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter escalation": {
+      "main": [
+        [
+          {
+            "node": "Merge support + escalation",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Reset support labels": {
+      "main": [
+        [
+          {
+            "node": "Create Gmail draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter partnership": {
+      "main": [
+        [
+          {
+            "node": "Reset support labels (partnership)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reset support labels (partnership)": {
+      "main": [
+        [
+          {
+            "node": "Apply Gmail label (partnership)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "tracking17_tool": {
+      "ai_tool": [
+        [
+          {
+            "node": "Support Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract email data": {
+      "main": [
+        [
+          {
+            "node": "Build claim SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build claim SQL": {
+      "main": [
+        [
+          {
+            "node": "Claim messages (dedup)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim messages (dedup)": {
+      "main": [
+        [
+          {
+            "node": "Recover claimed emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recover claimed emails": {
+      "main": [
+        [
+          {
+            "node": "Classify Non-Support Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter non-partnership": {
+      "main": [
+        [
+          {
+            "node": "Filter manual",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Filter auto-send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter manual": {
+      "main": [
+        [
+          {
+            "node": "Reset support labels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter auto-send": {
+      "main": [
+        [
+          {
+            "node": "Send auto reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send auto reply": {
+      "main": [
+        [
+          {
+            "node": "Label 🤖 auto-sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Label 🤖 auto-sent": {
+      "main": [
+        [
+          {
+            "node": "Mark Read + Archive (support)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Support Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge support + escalation": {
+      "main": [
+        [
+          {
+            "node": "Get Thread History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

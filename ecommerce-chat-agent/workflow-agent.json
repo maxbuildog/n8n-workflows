@@ -1,0 +1,591 @@
+{
+  "name": "Store Chat - AI Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "store-chat",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "YOUR_STORE_ORIGIN"
+        }
+      },
+      "id": "e8956973-d3cc-40a9-b087-fa95fc0ed66a",
+      "name": "Chat Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        304
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "check-auth",
+              "leftValue": "={{ $json.headers['authorization'] }}",
+              "rightValue": "Bearer YOUR_WIDGET_TOKEN",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ca344ffc-c294-447c-b4e4-668c79560ca7",
+      "name": "Validate Bearer Token",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        400,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"error\": \"Unauthorized\" }",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "bc1ff6a1-2cfc-4eb3-ba87-a5202dc70afe",
+      "name": "Respond 401 Unauthorized",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        560,
+        704
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.message }}",
+        "options": {
+          "systemMessage": "You are YOUR_AGENT_NAME, the AI chat assistant of YOUR_STORE_NAME. Write in plain, friendly, concise language.\n\nIDENTITY:\nNever claim or imply that you are a person. If asked, say you are an AI assistant. The system adds a short AI disclosure to the first reply of each session itself: do not write one yourself.\n\nSCOPE:\nYou help with questions about products, delivery, returns, warranty, subscriptions (only if the knowledge base covers them) and the status of an order. Nothing else.\n\nSAFETY:\nIf a message reports a safety problem or a concern about someone's wellbeing, do not answer on the substance and do not give advice. Say that a person from the support team should look at it, and give YOUR_SUPPORT_EMAIL. Ask them to include their order number. Never ignore or play down such a message.\n\nNO COMMITMENTS:\nNever promise a refund, replacement, reshipment, cancellation, delay, delivery date or discount code. Only the support team decides. Quote return and warranty terms exactly as written in the knowledge base, including any legal rights it mentions. Never invent terms. For a request you cannot settle, say: \"Please send the details and your order number to YOUR_SUPPORT_EMAIL and our team will review your request.\"\n\nKNOWLEDGE BASE (tool kb_store):\nYou have no product knowledge of your own. For any question about a product, a price, delivery, returns, warranty, usage or subscriptions, call kb_store first and use only what it returns. Never state a price, number, duration or claim that kb_store did not return. If kb_store has nothing relevant, reply with this sentence, word for word: \"I don't have that information.\" then give YOUR_SUPPORT_EMAIL.\n\nORDERS (tool order_lookup):\nAn order lookup needs BOTH the order number and the email address used for the order. If the customer gave only one, ask for the other before calling the tool. If the number has no leading #, add one. If the tool reports no matching order, do not guess or hint at anything: ask the customer to check both details, and mention YOUR_SUPPORT_EMAIL only after a second failed attempt. When an order is found, give its status, and the carrier and tracking link exactly as the tool returned them. Do not repeat the customer's email back.\n\nSUBSCRIPTIONS:\nIf the knowledge base describes subscriptions and the customer wants to change, pause or cancel one, share YOUR_SUBSCRIPTION_PORTAL_URL first, and YOUR_SUPPORT_EMAIL if that does not work.\n\nSTYLE:\nAnswer only what was asked. If the question is vague, ask one clarifying question. At most 3 short sentences. No Markdown, no bullet lists, no emojis. Answer in the language the customer writes in.",
+          "maxIterations": 5,
+          "returnIntermediateSteps": false
+        }
+      },
+      "id": "43dd3e8f-e7cf-4b15-9bef-18672d17c95f",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        900,
+        304
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "model": "gpt-4.1-mini",
+        "options": {
+          "maxTokens": 400,
+          "temperature": 0.3
+        }
+      },
+      "id": "864fee1d-4169-4fcd-a79c-a35900a3ecaa",
+      "name": "Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [
+        820,
+        480
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_ME",
+          "name": "openAiApi"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Validate Input').item.json.sessionId }}",
+        "tableName": "chatbot_memory"
+      },
+      "id": "c8ddd1da-cba3-412c-9776-3b333878ad9e",
+      "name": "Postgres Chat Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.3,
+      "position": [
+        960,
+        480
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { reply: $('Check Unanswered').item.json.output, sessionId: $('Check Unanswered').item.json.sessionId } }}",
+        "options": {}
+      },
+      "id": "281cf733-1dac-4800-84d4-0388e9b7356e",
+      "name": "Respond to Widget",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1340,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_N8N_HOST/webhook/order-status-lookup",
+        "sendBody": true,
+        "parametersBody": {
+          "values": [
+            {
+              "name": "email",
+              "valueProvider": "modelOptional"
+            },
+            {
+              "name": "order_number",
+              "valueProvider": "modelOptional"
+            }
+          ]
+        },
+        "toolDescription": "Looks up one store order. Requires BOTH the order number and the email address used for the order, and answers only when they match the same order. Returns the order status, shipping state, carrier and tracking link. When nothing matches, it returns a neutral message and reveals nothing else.",
+        "specifyBody": "keypair",
+        "placeholderDefinitions": {
+          "values": [
+            {
+              "name": "email",
+              "description": "Email address used for the order, exactly as the customer wrote it (required)",
+              "type": "string"
+            },
+            {
+              "name": "order_number",
+              "description": "Order number, with or without a leading # (required)",
+              "type": "string"
+            }
+          ]
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "ccd89ce9-bb1a-4cbe-bb44-5740286c0b2c",
+      "name": "order_lookup",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        496
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "Order lookup webhook auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const GAP_PHRASE = \"i don't have that information\";\nconst SUPPORT_EMAIL = 'YOUR_SUPPORT_EMAIL';\n// AI disclosure, put in front of the first reply of a session by this code (not by the model).\nconst AI_DISCLOSURE = 'YOUR_AI_DISCLOSURE';\nconst MAX_LENGTH = 700;\nlet reply = $input.first().json.output || '';\nconst question = $('Validate Input').item.json.message || '';\nconst sessionId = $('Validate Input').item.json.sessionId || '';\nconst isFirstMessage = $('Validate Input').item.json.is_first_message !== false;\n\nfunction cleanWidgetReply(value) {\n  let text = String(value || '').trim();\n\n  // Output guardrail for the chat widget: plain text only, at most 3 paragraphs.\n  text = text\n    .replace(/```[\\s\\S]*?```/g, '')\n    .replace(/^\\s*#{1,6}\\s+/gm, '')\n    .replace(/\\*\\*/g, '')\n    .replace(/\\*/g, '')\n    .replace(/[\\u2022\\u00b7]/g, '')\n    .replace(/[\\u2013\\u2014]/g, ', ')\n    .replace(/^\\s*[-+]\\s+/gm, '')\n    .replace(/^\\s*\\d+[.)]\\s+/gm, '')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .replace(/[ \\t]{2,}/g, ' ')\n    .trim();\n\n  text = text.split(/\\n\\s*\\n/).map(p => p.trim()).filter(Boolean).slice(0, 3).join('\\n\\n');\n\n  if (text.length > MAX_LENGTH) {\n    const cut = text.slice(0, MAX_LENGTH);\n    const lastStop = Math.max(cut.lastIndexOf('.'), cut.lastIndexOf('?'), cut.lastIndexOf('!'));\n    text = (lastStop > 320 ? cut.slice(0, lastStop + 1) : cut).trim();\n  }\n\n  return text || ('Sorry, I could not put together a clear answer. Please write to ' + SUPPORT_EMAIL + ' and a person will help.');\n}\n\nreply = cleanWidgetReply(reply);\n\n// Log only real knowledge gaps: the agent used the exact gap sentence from its prompt,\n// or the cleanup had to fall back. Routing to support or a failed order lookup is not a gap.\nconst lower = reply.toLowerCase();\nconst is_no_answer = lower.includes(GAP_PHRASE) || lower.includes('could not put together a clear answer');\n\n// The gap check above runs on the model's own text. The disclosure is added afterwards, once per session.\nconst output = isFirstMessage && AI_DISCLOSURE ? AI_DISCLOSURE + ' ' + reply : reply;\n\nreturn [{ json: { output, question, sessionId, is_no_answer } }];\n"
+      },
+      "id": "ac7fc60b-52ed-4b41-97b7-5e291575ec4d",
+      "name": "Check Unanswered",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/pages",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"parent\": { \"database_id\": \"YOUR_NOTION_DATABASE_ID\" },\n  \"properties\": {\n    \"Question\": {\n      \"title\": [{ \"text\": { \"content\": {{ JSON.stringify($json.question.substring(0, 1000)) }} } }]\n    },\n    \"Status\": {\n      \"select\": { \"name\": \"To review\" }\n    },\n    \"Agent reply\": {\n      \"rich_text\": [{ \"text\": { \"content\": {{ JSON.stringify($json.output.substring(0, 2000)) }} } }]\n    },\n    \"SessionId\": {\n      \"rich_text\": [{ \"text\": { \"content\": {{ JSON.stringify($json.sessionId) }} } }]\n    }\n  }\n}",
+        "options": {},
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "d7e4b915-46a2-48e9-9f32-3c227ac5fcf7",
+      "name": "Log to Notion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1740,
+        272
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "httpHeaderAuth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.is_no_answer }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              }
+            }
+          ],
+          "options": {}
+        },
+        "options": {}
+      },
+      "id": "387c4ce2-99a4-4951-acb9-66443477c060",
+      "name": "Unanswered?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        272
+      ]
+    },
+    {
+      "id": "9d2b82b5-6b0e-4c26-a1c8-7c4208fd1d33",
+      "name": "Respond Fallback",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1140,
+        496
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { reply: \"Sorry, something went wrong on my side. I am an AI assistant and I could not finish this answer. Please try again, or write to YOUR_SUPPORT_EMAIL and a person will help.\", sessionId: $('Validate Input').item.json.sessionId || '' } }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "67c05ce0-5d12-4621-a024-37fb2c6c0bd7",
+      "name": "Ollama Embeddings (KB)",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOllama",
+      "typeVersion": 1,
+      "position": [
+        1000,
+        700
+      ],
+      "parameters": {
+        "model": "nomic-embed-text:latest"
+      },
+      "credentials": {
+        "ollamaApi": {
+          "id": "REPLACE_ME",
+          "name": "ollamaApi"
+        }
+      }
+    },
+    {
+      "id": "65b0ef20-f194-4c76-8cc8-1904e7735ced",
+      "name": "kb_store",
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePGVector",
+      "typeVersion": 1.3,
+      "position": [
+        1000,
+        590
+      ],
+      "parameters": {
+        "mode": "retrieve-as-tool",
+        "topK": 6,
+        "toolDescription": "Searches the store's official knowledge base: products, prices, delivery, returns, warranty, usage, subscriptions and support contacts. Write the query as short keywords, not a full question: the product name first, then the topic. Examples: 'Product A price', 'Product B warranty', 'Product A usage', 'delivery time', 'return policy'.",
+        "tableName": "YOUR_KB_TABLE",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input guard: message must be a non-empty string of at most MAX_MESSAGE_LENGTH characters,\n// and the widget must send a random session id (UUID). No fallback to email or IP.\nconst MAX_MESSAGE_LENGTH = 1000;\nconst UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;\nconst body = $input.first().json.body || {};\nconst message = typeof body.message === 'string' ? body.message.trim() : '';\nconst sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';\nlet error = '';\nif (!message) error = 'message_required';\nelse if (message.length > MAX_MESSAGE_LENGTH) error = 'message_too_long';\nelse if (!UUID_RE.test(sessionId)) error = 'session_id_required';\n// isFirstMessage is sent by the widget: true on the first message of a session, false afterwards.\n// If it is missing, the AI disclosure is added to every reply (the safe default).\nconst isFirstMessage = !(body.isFirstMessage === false || body.isFirstMessage === 'false');\nreturn [{ json: { valid: error === '', error, message, sessionId, is_first_message: isFirstMessage } }];\n"
+      },
+      "id": "dbf3ee21-5bfc-4206-8c35-d9bfee53545c",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "input-valid",
+              "leftValue": "={{ $json.valid }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0ac6e2e5-b5f7-4996-8c19-d61ba97c657a",
+      "name": "Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        720,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: $json.error } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "36f8e3ba-9e5f-4165-abd8-95a6110e0eb1",
+      "name": "Respond 400 Bad Request",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        880,
+        880
+      ]
+    }
+  ],
+  "connections": {
+    "Validate Bearer Token": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401 Unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Check Unanswered",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres Chat Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Unanswered": {
+      "main": [
+        [
+          {
+            "node": "Respond to Widget",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unanswered?": {
+      "main": [
+        [
+          {
+            "node": "Log to Notion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Widget": {
+      "main": [
+        [
+          {
+            "node": "Unanswered?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Embeddings (KB)": {
+      "ai_embedding": [
+        [
+          {
+            "node": "kb_store",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "kb_store": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Bearer Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 400 Bad Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "order_lookup": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

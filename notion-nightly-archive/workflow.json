@@ -1,0 +1,360 @@
+{
+  "name": "Nightly Notion archive: move finished tasks from TODO to DONE",
+  "nodes": [
+    {
+      "id": "7801bfb2-b471-4e9e-bbda-e241c7595bcf",
+      "name": "Every night 1am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 1,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "disabled": false
+    },
+    {
+      "id": "9e379d0a-066d-4d1d-b44f-da798a1e868d",
+      "name": "Archive engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Archive engine, TODO to DONE: one Notion request per pass through the loop.\r\n// Order per task: read the blocks, look for an existing archive, create and copy, re-read and compare,\r\n// re-check the source, and only then move it to the trash (reversible for 30 days).\r\n// DATABASE ids (classic Notion API, as required by the n8n credential; single-source databases).\r\nconst TODO_DB = 'YOUR_TODO_DATABASE_ID';\r\nconst DONE_DB = 'YOUR_DONE_DATABASE_ID';\r\n// ---- CONFIG: adapt to your own Notion databases (see README, Setup) ----\r\nconst STAGE_DONE = 'Done'; // option of the select property that marks a task as finished\r\nconst P = { // Notion property names\r\n  TITLE: 'Task', // title (both databases)\r\n  STAGE: 'Stage', // select, TODO database\r\n  CHECKBOX: 'Is done', // checkbox, TODO database (alternative way to mark a task as finished)\r\n  FINISH: 'Finish date', // date, TODO database\r\n  SOURCE: 'Source task', // url, DONE database (link back to the original task)\r\n  ARCHIVED_ON: 'Archived on', // date, DONE database\r\n  COMPLETED: 'Completed date', // date, DONE database\r\n};\r\nconst TIMEZONE = 'UTC';\r\n// Prefix of the link stored in the DONE database (page id appended without dashes). Any URL that opens the page works.\r\nconst NOTION_PAGE_BASE_URL = 'https://www.notion.so/';\r\nconst FINISH_FALLBACK = 'empty'; // when the finish date is empty: 'empty' (leave Completed date empty) or 'archive' (use the archive date)\r\nconst MAX_STEPS = 3000;\r\nconst MAX_BLOCKS = 800;\r\nconst SELECTS = ['Project', 'Priority', 'Category']; // select properties copied from TODO to DONE (options must exist in DONE)\r\nconst MEDIA = ['image', 'video', 'file', 'pdf', 'audio'];\r\nconst COPIABLE = ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item',\r\n  'to_do', 'toggle', 'quote', 'callout', 'code', 'divider', 'equation', 'bookmark', 'embed',\r\n  'table_of_contents', 'breadcrumb', 'link_to_page', 'table', 'table_row', ...MEDIA];\r\n// Writable fields per block type (Notion returns fields on read that it refuses on write).\r\nconst TXT = ['rich_text', 'color'];\r\nconst WRITABLE = {\r\n  paragraph: TXT, bulleted_list_item: TXT, numbered_list_item: TXT, quote: TXT, toggle: TXT,\r\n  to_do: [...TXT, 'checked'], callout: [...TXT, 'icon'],\r\n  heading_1: [...TXT, 'is_toggleable'], heading_2: [...TXT, 'is_toggleable'], heading_3: [...TXT, 'is_toggleable'],\r\n  code: ['rich_text', 'caption', 'language'], bookmark: ['url', 'caption'], embed: ['url', 'caption'],\r\n  equation: ['expression'], divider: [], breadcrumb: [], table_of_contents: ['color'],\r\n  table: ['table_width', 'has_column_header', 'has_row_header'],\r\n};\r\n\r\nconst input = $input.first().json;\r\nlet s, resp = null;\r\nif (input.state) { s = input.state; resp = input.resp; }\r\nelse {\r\n  const body = input.body || {};\r\n  s = {\r\n    phase: 'schema', steps: 0, log: [], tasks: [], idx: 0, cursor: null, cur: null, read: null, write: null,\r\n    dryRun: body.dryRun === true, simErr: typeof body.simErr === 'string' ? body.simErr : '', prefix: typeof body.prefix === 'string' ? body.prefix : '',\r\n    archiveDate: $now.setZone(TIMEZONE).toISODate(), startedAt: $now.toISO(), fatal: null,\r\n  };\r\n}\r\n\r\nconst R = (method, path, body) => ({ method, path, body: body || null });\r\nconst hex = id => id.replace(/-/g, '');\r\nconst rt = a => (a || []).map(x => x.plain_text).join('');\r\nconst sel = p => (p && p.select ? p.select.name : null);\r\nconst trashed = r => r.archived === true || r.in_trash === true;\r\nconst isErr = r => r && (r.error !== undefined || r.object === 'error');\r\nconst normDate = x => (x ? (x.length > 10 ? new Date(x).toISOString() : x) : null);\r\n\r\nfunction go(phase) { s.phase = phase; return H[phase](null); }\r\nfunction record(status, detail) {\r\n  const c = s.cur;\r\n  s.log.push({ status, detail: detail || '', task: c.title, source: c.id, archive: c.arcId || null });\r\n  s.idx++; s.cur = null; s.read = null; s.write = null;\r\n  return go('nextTask');\r\n}\r\n// Failure after creation: the archive created by THIS pass is removed (never a pre-existing archive).\r\nfunction fail(status, detail) {\r\n  const c = s.cur;\r\n  if (c.created && c.arcId && !c.rolledBack) {\r\n    c.rolledBack = true; c.rbStatus = status; c.rbDetail = detail;\r\n    return go('rollback');\r\n  }\r\n  return record(status, detail);\r\n}\r\nfunction readTree(rootId, target, then) {\r\n  s.read = { queue: [rootId], cursor: null, kids: {}, count: 0, root: rootId, target, then };\r\n  return go('read');\r\n}\r\nfunction build(id) {\r\n  return (s.read.kids[id] || []).map(b => ({ b, kids: b.has_children && s.read.kids[b.id] ? build(b.id) : null }));\r\n}\r\nfunction walk(tree, fn) { for (const n of tree) { fn(n); if (n.kids) walk(n.kids, fn); } }\r\nfunction sig(tree, depth = 0, out = []) {\r\n  for (const n of tree) {\r\n    const t = n.b.type, d = n.b[t] || {};\r\n    let txt = rt(d.rich_text);\r\n    if (t === 'to_do') txt += d.checked ? ' [x]' : ' [ ]';\r\n    if (t === 'code') txt += ' |' + d.language;\r\n    if (t === 'bookmark' || t === 'embed') txt += ' |' + d.url;\r\n    if (MEDIA.includes(t)) txt += ' |' + (d.external ? d.external.url : '') + ' |' + rt(d.caption);\r\n    if (t === 'equation') txt = d.expression;\r\n    if (t === 'table_row') txt = d.cells.map(rt).join(' ¦ ');\r\n    out.push(depth + '|' + t + '|' + txt);\r\n    if (n.kids) sig(n.kids, depth + 1, out);\r\n  }\r\n  return out;\r\n}\r\nfunction cleanRT(arr) {\r\n  return (arr || []).map(x => {\r\n    const a = x.annotations;\r\n    if (x.type === 'text') return { type: 'text', text: { content: x.text.content, link: x.text.link || null }, annotations: a };\r\n    if (x.type === 'equation') return { type: 'equation', equation: { expression: x.equation.expression }, annotations: a };\r\n    if (x.type === 'mention') {\r\n      const m = x.mention, mt = m.type;\r\n      if (mt === 'user' || mt === 'page' || mt === 'database') return { type: 'mention', mention: { type: mt, [mt]: { id: m[mt].id } }, annotations: a };\r\n      if (mt === 'date') return { type: 'mention', mention: { type: 'date', date: m.date }, annotations: a };\r\n    }\r\n    // Mention that cannot be rewritten (link preview, etc.): same text, link kept.\r\n    return { type: 'text', text: { content: x.plain_text, link: x.href ? { url: x.href } : null }, annotations: a };\r\n  });\r\n}\r\nfunction clean(n) {\r\n  const t = n.b.type, d = JSON.parse(JSON.stringify(n.b[t] || {}));\r\n  delete d.children;\r\n  for (const k of Object.keys(d)) if (d[k] === null || (WRITABLE[t] && !WRITABLE[t].includes(k))) delete d[k];\r\n  if (d.rich_text) d.rich_text = cleanRT(d.rich_text);\r\n  if (d.caption) d.caption = cleanRT(d.caption);\r\n  if (MEDIA.includes(t)) {\r\n    const m = { type: 'external', external: { url: d.external.url }, caption: d.caption || [] };\r\n    if (t === 'file' && d.name) m.name = d.name;\r\n    return { object: 'block', type: t, [t]: m };\r\n  }\r\n  if (t === 'callout' && d.icon && d.icon.type !== 'emoji' && d.icon.type !== 'external') delete d.icon;\r\n  if (t === 'link_to_page') return { object: 'block', type: t, [t]: { type: d.type, [d.type]: d[d.type] } };\r\n  if (t === 'table') {\r\n    d.children = (n.kids || []).map(k => ({ object: 'block', type: 'table_row', table_row: { cells: k.b.table_row.cells.map(cleanRT) } }));\r\n  }\r\n  return { object: 'block', type: t, [t]: d };\r\n}\r\nfunction finDate(c) {\r\n  if (c.fin && c.fin.start) {\r\n    const d = { start: c.fin.start };\r\n    if (c.fin.end) d.end = c.fin.end;\r\n    if (c.fin.time_zone) d.time_zone = c.fin.time_zone;\r\n    return d;\r\n  }\r\n  return FINISH_FALLBACK === 'archive' ? { start: s.archiveDate } : null;\r\n}\r\nfunction props(c) {\r\n  const p = {\r\n    [P.TITLE]: { title: cleanRT(c.titleRT) },\r\n    [P.SOURCE]: { url: NOTION_PAGE_BASE_URL + hex(c.id) },\r\n    [P.ARCHIVED_ON]: { date: { start: s.archiveDate } },\r\n  };\r\n  for (const k of SELECTS) if (c[k]) p[k] = { select: { name: c[k] } };\r\n  const d = finDate(c);\r\n  if (d) p[P.COMPLETED] = { date: d };\r\n  return p;\r\n}\r\n\r\nconst H = {\r\n  schema(r) {\r\n    if (!r) return R('GET', `databases/${DONE_DB}`);\r\n    s.doneOpts = {};\r\n    for (const k of SELECTS) {\r\n      const p = r.properties && r.properties[k];\r\n      s.doneOpts[k] = p && p.select ? p.select.options.map(o => o.name) : [];\r\n    }\r\n    return go('query');\r\n  },\r\n  query(r) {\r\n    if (!r) {\r\n      // Finished = stage set to the done option OR the checkbox ticked (some views have no stage).\r\n      const body = { filter: { or: [{ property: P.STAGE, select: { equals: STAGE_DONE } }, { property: P.CHECKBOX, checkbox: { equals: true } }] }, page_size: 100 };\r\n      if (s.cursor) body.start_cursor = s.cursor;\r\n      return R('POST', `databases/${TODO_DB}/query`, body);\r\n    }\r\n    for (const p of r.results) {\r\n      if (p.object !== 'page' || trashed(p)) continue;\r\n      const pr = p.properties, title = (pr[P.TITLE] && pr[P.TITLE].title) || [];\r\n      const t = { id: p.id, title: rt(title), titleRT: title, edited: p.last_edited_time,\r\n        fin: pr[P.FINISH] && pr[P.FINISH].date ? pr[P.FINISH].date : null };\r\n      for (const k of SELECTS) t[k] = sel(pr[k]);\r\n      if (s.prefix && !t.title.startsWith(s.prefix)) continue;\r\n      s.tasks.push(t);\r\n    }\r\n    if (r.has_more) { s.cursor = r.next_cursor; return H.query(null); }\r\n    s.cursor = null;\r\n    return go('nextTask');\r\n  },\r\n  nextTask() {\r\n    if (s.idx >= s.tasks.length) { s.phase = 'done'; return null; }\r\n    s.cur = JSON.parse(JSON.stringify(s.tasks[s.idx]));\r\n    return readTree(s.cur.id, 'srcTree', 'afterSrc');\r\n  },\r\n  read(r) {\r\n    const rd = s.read;\r\n    if (r) {\r\n      const parent = rd.queue[0];\r\n      rd.kids[parent] = (rd.kids[parent] || []).concat(r.results);\r\n      rd.count += r.results.length;\r\n      if (rd.count > MAX_BLOCKS) return record('kept', `more than ${MAX_BLOCKS} blocks`);\r\n      for (const b of r.results) if (b.has_children && COPIABLE.includes(b.type)) rd.queue.push(b.id);\r\n      if (r.has_more) rd.cursor = r.next_cursor;\r\n      else { rd.cursor = null; rd.queue.shift(); }\r\n    }\r\n    if (rd.queue.length) {\r\n      return R('GET', `blocks/${rd.queue[0]}/children?page_size=100` + (rd.cursor ? `&start_cursor=${encodeURIComponent(rd.cursor)}` : ''));\r\n    }\r\n    s.cur[rd.target] = build(rd.root);\r\n    const then = rd.then;\r\n    s.read = null;\r\n    return go(then);\r\n  },\r\n  afterSrc() {\r\n    const c = s.cur, bad = new Set();\r\n    walk(c.srcTree, n => {\r\n      const t = n.b.type, d = n.b[t] || {};\r\n      if (!COPIABLE.includes(t)) bad.add(t);\r\n      else if (MEDIA.includes(t) && d.type !== 'external') bad.add(`${t} (file hosted by Notion)`);\r\n      else if (t === 'table' && n.kids && n.kids.length > 100) bad.add('table with more than 100 rows');\r\n      else if (t === 'link_to_page' && d.type !== 'page_id' && d.type !== 'database_id') bad.add('link_to_page');\r\n    });\r\n    if (bad.size) return record('kept', 'blocks that cannot be copied: ' + [...bad].join(', '));\r\n    for (const k of SELECTS) {\r\n      if (c[k] && !(s.doneOpts[k] || []).includes(c[k])) return record('kept', `option \"${c[k]}\" missing from DONE (${k})`);\r\n    }\r\n    return go('search');\r\n  },\r\n  search(r) {\r\n    const c = s.cur;\r\n    if (!r) {\r\n      return R('POST', `databases/${DONE_DB}/query`, { page_size: 10, filter: { or: [\r\n        { property: P.SOURCE, url: { contains: hex(c.id) } },\r\n        { property: P.SOURCE, url: { contains: c.id } },\r\n      ] } });\r\n    }\r\n    const hits = r.results.filter(p => !trashed(p));\r\n    if (hits.length > 1) return record('kept', `${hits.length}${r.has_more ? '+' : ''} archives in DONE for this task: ` + hits.slice(0, 5).map(h => h.id).join(', '));\r\n    if (hits.length === 1) { c.arcId = hits[0].id; c.preexisting = true; return go('verifyProps'); }\r\n    return go('create');\r\n  },\r\n  create(r) {\r\n    const c = s.cur;\r\n    if (!r) {\r\n      // Test only (webhook body): nonexistent target database to provoke a real Notion error.\r\n      const db = s.simErr && c.title.normalize('NFC') === s.simErr.normalize('NFC') ? 'nonexistent-database-id' : DONE_DB;\r\n      return R('POST', 'pages', { parent: { database_id: db }, properties: props(c) });\r\n    }\r\n    c.arcId = r.id; c.created = true;\r\n    s.write = { queue: c.srcTree.length ? [{ target: r.id, kids: c.srcTree }] : [] };\r\n    return go('write');\r\n  },\r\n  write(r) {\r\n    const w = s.write, c = s.cur;\r\n    if (r) {\r\n      const item = w.queue[0], chunk = item.kids.slice(0, 100), res = r.results || [];\r\n      if (res.length !== chunk.length) return fail('error', `partial copy: ${res.length}/${chunk.length} blocks written, archive ${c.arcId} to check`);\r\n      chunk.forEach((n, i) => {\r\n        if (n.kids && n.kids.length && n.b.type !== 'table') w.queue.push({ target: res[i].id, kids: n.kids });\r\n      });\r\n      item.kids = item.kids.slice(100);\r\n      if (!item.kids.length) w.queue.shift();\r\n    }\r\n    if (!w.queue.length) { s.write = null; return go('verifyProps'); }\r\n    const item = w.queue[0];\r\n    return R('PATCH', `blocks/${item.target}/children`, { children: item.kids.slice(0, 100).map(clean) });\r\n  },\r\n  verifyProps(r) {\r\n    const c = s.cur;\r\n    if (!r) return R('GET', `pages/${c.arcId}`);\r\n    const p = r.properties || {}, diffs = [];\r\n    if (trashed(r)) diffs.push('archive in trash');\r\n    if (rt(p[P.TITLE] && p[P.TITLE].title) !== c.title) diffs.push('title');\r\n    for (const k of SELECTS) if (sel(p[k]) !== c[k]) diffs.push(k);\r\n    const src = (p[P.SOURCE] && p[P.SOURCE].url) || '';\r\n    if (!src.replace(/-/g, '').includes(hex(c.id))) diffs.push(P.SOURCE);\r\n    if (c.created) {\r\n      const d = finDate(c), got = p[P.COMPLETED] && p[P.COMPLETED].date;\r\n      if (normDate(d ? d.start : null) !== normDate(got ? got.start : null)) diffs.push(P.COMPLETED);\r\n    }\r\n    if (diffs.length) return fail('kept', (c.preexisting ? 'existing archive' : 'created archive') + ` differs on: ${diffs.join(', ')}`);\r\n    return readTree(c.arcId, 'arcTree', 'compare');\r\n  },\r\n  compare() {\r\n    const c = s.cur, a = sig(c.srcTree), b = sig(c.arcTree);\r\n    const i = a.findIndex((x, j) => x !== b[j]);\r\n    if (a.length !== b.length || i >= 0) {\r\n      return fail('kept', (c.preexisting ? 'existing archive incomplete' : 'incomplete copy')\r\n        + ` (${b.length}/${a.length} blocks, first difference at block ${i >= 0 ? i : Math.min(a.length, b.length)})`);\r\n    }\r\n    c.srcTree = null; c.arcTree = null;\r\n    return go('recheck');\r\n  },\r\n  recheck(r) {\r\n    const c = s.cur;\r\n    if (!r) return R('GET', `pages/${c.id}`);\r\n    if (trashed(r)) return record('already removed', 'source already in trash');\r\n    const pr = r.properties || {};\r\n    if (sel(pr[P.STAGE]) !== STAGE_DONE && !(pr[P.CHECKBOX] && pr[P.CHECKBOX].checkbox === true)) return record('kept', \"the task is no longer done (neither the done stage nor the checkbox)\");\r\n    if (r.last_edited_time !== c.edited) return record('kept', \"task edited during archiving, will be retried on the next run\");\r\n    if (s.dryRun) return record(c.preexisting ? 'already present (test, source kept)' : 'archived (test, source kept)');\r\n    return go('trash');\r\n  },\r\n  trash(r) {\r\n    const c = s.cur;\r\n    if (!r) return R('PATCH', `pages/${c.id}`, { archived: true });\r\n    if (!trashed(r)) return record('error', 'trash move not confirmed');\r\n    return record(c.preexisting ? 'already present' : 'archived', c.preexisting ? 'existing archive verified, source removed' : '');\r\n  },\r\n  rollback(r) {\r\n    const c = s.cur;\r\n    if (!r) return R('PATCH', `pages/${c.arcId}`, { archived: true });\r\n    return record(c.rbStatus, c.rbDetail + (trashed(r) ? '; partial archive removed from DONE' : '; partial archive to remove by hand'));\r\n  },\r\n  done() { return null; },\r\n};\r\n\r\nlet out = null;\r\ntry {\r\n  if (resp !== null && isErr(resp)) {\r\n    const e = resp.error || resp;\r\n    const msg = String(e.description || e.message || JSON.stringify(e)).slice(0, 300);\r\n    if (!s.cur) s.fatal = `Notion error at step ${s.phase}: ${msg}`;\r\n    else if (s.phase === 'rollback') out = record(s.cur.rbStatus, `${s.cur.rbDetail}; removing the partial archive failed (${msg}), to be done by hand`);\r\n    else out = fail('error', `step ${s.phase}: ${msg}`);\r\n  } else {\r\n    out = H[s.phase](resp);\r\n  }\r\n} catch (e) {\r\n  s.fatal = `Exception at step ${s.phase}: ${e.message}`;\r\n  out = null;\r\n}\r\nif (out && !s.fatal) {\r\n  s.steps++;\r\n  if (s.steps > MAX_STEPS) { s.fatal = 'Request cap reached'; out = null; }\r\n}\r\nif (out && !s.fatal) return [{ json: { action: 'request', req: out, state: s } }];\r\nreturn [{ json: { action: 'done', state: s } }];\r\n"
+      }
+    },
+    {
+      "id": "dea59e95-4fef-44d5-925f-aa815b31c3c7",
+      "name": "Request to make?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "request",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "2561943c-4244-4062-8c87-1600edbf40d3",
+      "name": "Notion rate limit pause",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        700,
+        0
+      ],
+      "parameters": {
+        "amount": 0.35
+      },
+      "webhookId": "73f402f4-f4e8-4354-b679-35f23be32e62"
+    },
+    {
+      "id": "8bea9339-6ab0-4721-8cf1-a123f9e0ae80",
+      "name": "Notion API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        920,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "notionApi": {
+          "id": "REPLACE_ME",
+          "name": "notionApi"
+        }
+      },
+      "parameters": {
+        "method": "={{ $json.req.method }}",
+        "url": "=https://api.notion.com/v1/{{ $json.req.path }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.req.body || {}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "fe152fc2-af1a-4a28-a34f-c478416354f7",
+      "name": "Attach state",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1140,
+        0
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "state",
+              "value": "={{ $('Archive engine').item.json.state }}",
+              "type": "object"
+            },
+            {
+              "id": "a2",
+              "name": "resp",
+              "value": "={{ $json }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "4853b305-46c3-4af1-9bfe-30db0d92a44c",
+      "name": "Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Run summary: counters + log (source and archive ids for each task).\nconst s = $input.first().json.state;\nconst n = prefix => s.log.filter(l => l.status.startsWith(prefix)).length;\nconst summary = {\n  date: s.archiveDate,\n  test: s.dryRun,\n  title_filter: s.prefix || null,\n  found: s.tasks.length,\n  archived: n('archived'),\n  already_present: n('already present'),\n  already_removed: n('already removed'),\n  kept: n('kept'),\n  errors: n('error'),\n  notion_requests: s.steps,\n  fatal: s.fatal,\n  current_task_if_fatal: s.fatal && s.cur ? s.cur.title : null,\n  log: s.log,\n};\nconst anomalies = summary.kept + summary.errors + (s.fatal ? 1 : 0);\nconst lines = [\n  `🗂️ TODO to DONE archive of ${s.archiveDate}`,\n  `Found: ${summary.found} · archived: ${summary.archived} · already present: ${summary.already_present} · kept in TODO: ${summary.kept + summary.errors}`,\n];\nif (s.fatal) lines.push(`⛔ Stopped: ${s.fatal}` + (summary.current_task_if_fatal ? ` (task \"${summary.current_task_if_fatal}\")` : ''));\nfor (const l of s.log.filter(x => x.status.startsWith('kept') || x.status.startsWith('error'))) {\n  lines.push(`• \"${l.task}\": ${l.status}, ${l.detail}`);\n}\nconst html = lines.join('\\n').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nreturn [{ json: { ...summary, anomalies, message: html } }];\n"
+      }
+    },
+    {
+      "id": "e2bd5f7c-fb11-4bb2-bc1f-2c2be41d3b09",
+      "name": "Anomaly outside test?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        920,
+        220
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.anomalies }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            },
+            {
+              "id": "c3",
+              "leftValue": "={{ $json.test }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "75f725f0-8f38-4874-b894-41c04fb1f574",
+      "name": "Telegram alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1140,
+        220
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "telegramApi"
+        }
+      },
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "webhookId": "45e26ef6-6ebd-472a-8001-f7a74658d3d9"
+    },
+    {
+      "id": "72eaf560-0166-4276-840b-9cb02ef1bfba",
+      "name": "Nothing to report",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1140,
+        400
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Every night 1am": {
+      "main": [
+        [
+          {
+            "node": "Archive engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Archive engine": {
+      "main": [
+        [
+          {
+            "node": "Request to make?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request to make?": {
+      "main": [
+        [
+          {
+            "node": "Notion rate limit pause",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion rate limit pause": {
+      "main": [
+        [
+          {
+            "node": "Notion API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion API": {
+      "main": [
+        [
+          {
+            "node": "Attach state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach state": {
+      "main": [
+        [
+          {
+            "node": "Archive engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summary": {
+      "main": [
+        [
+          {
+            "node": "Anomaly outside test?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anomaly outside test?": {
+      "main": [
+        [
+          {
+            "node": "Telegram alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nothing to report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
